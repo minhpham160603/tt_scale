@@ -1,69 +1,56 @@
 import random
 from datasets import load_dataset
+import torch
 
 from .prm.custom_prm import CustomPRM
 from .generator.custom_generator import Generator
-from .generator.backtrack_generator import BacktrackGenerator
-from .prm.logits_prm import LogitPRM
-from transformers import BitsAndBytesConfig
-import torch
+from .generator.backtrack_generator import BacktrackGenerator, STOP_STRING
 from .base_classes import AbstractGenerator, AbstractPRM
 
 # ==========================================
 # Configuration
 # ==========================================
 
-# Sequential hybrid search (original)
-K_TOKENS = 64          # How many tokens to generate per "step"
-TAU = 0.5              # Score threshold to keep a step (0.0 to 1.0)
-MAX_BACKTRACKS = 3     # How many times to retry a step if score is low
+# Sequential hybrid search
+K_TOKENS = 64          
+TAU = 0.5              
+MAX_BACKTRACKS = 3     
 
-NUM_SAMPLES = 3        # Number of GSM8K samples to test
+NUM_SAMPLES = 3        
 
-# Parallel hybrid search (mirrors BacktrackAlgoParallel.ipynb)
+# Parallel hybrid search
 PAR_K_TOKENS = 20
 PAR_TAU = 0.4
-MAX_RETRIES = 5            # Per-branch retries before pruning
-M_EXPANSION = 3            # How many clones to spawn when a branch fails
-MAX_TOTAL_BRANCHES = 8     # Hard cap on number of live branches
-MAX_STEPS = 30             # Max generation "steps" per run
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-)
+MAX_RETRIES = 5            
+M_EXPANSION = 3            
+MAX_TOTAL_BRANCHES = 8     
+MAX_STEPS = 30             
 
 
 class HybridSearcher:
-    def __init__(self, generator: AbstractGenerator, prm: AbstractPRM, max_output_len: int = 512):
-        # Initialize our two custom classes
+    def __init__(self, generator: AbstractGenerator, prm: AbstractPRM, max_output_len: int = 1024):
         self.generator = generator
         self.prm = prm
         self.max_output_len = max_output_len
+        if hasattr(generator, 'tokenizer'):
+            self.tokenizer = generator.tokenizer
+        else:
+            raise AttributeError("Generator must have a tokenizer.")
 
     # --------------------------------------------------
-    #  Sequential backtracking hybrid search (existing)
+    #  Sequential backtracking
     # --------------------------------------------------
     def run(self, prompt: str) -> str:
-        """
-        Original *sequential* hybrid search:
-        - Expand a single trajectory step-by-step.
-        - Use the PRM score to decide whether to keep or backtrack.
-        """
-        print(f"\n--- New Run (sequential): {prompt} ---\n")
-        
-        # Initial State
+        print(f"\n--- New Run (sequential): {prompt[:50]}... ---\n")
         initial_ids = self.generator.tokenize(prompt)
         prompt_len = initial_ids.shape[1]
-        checkpoints = [(initial_ids, None, 0)]  # (ids, cache, num_backtracks)
+        checkpoints = [(initial_ids, None, 0)]  
         finished = False
         response_part = ""
 
         while not finished and checkpoints:
             current_ids, current_cache, bt_count = checkpoints[-1]
 
-            # Safety: stop if we exceed a maximum length
             if current_ids.shape[1] > self.max_output_len:
                 print("  -> Reached max_output_len, stopping.")
                 finished = True
@@ -86,7 +73,6 @@ class HybridSearcher:
                 if bt_count < MAX_BACKTRACKS:
                     _ids, _cache, _ = checkpoints.pop()
                     checkpoints.append((_ids, _cache, bt_count + 1))
-                    print(f"  -> Retrying step... (Attempt {bt_count + 1}/{MAX_BACKTRACKS})")
                 else:
                     print("  -> MAX RETRIES. Forced accept.")
                     checkpoints.append((updated_full_ids, new_cache, 0))
@@ -94,135 +80,152 @@ class HybridSearcher:
         return response_part
 
     # --------------------------------------------------
-    #  Parallel hybrid search (branching version)
+    #  Parallel hybrid search
     # --------------------------------------------------
-    def run_parallel(
-        self,
-        prompt: str,
-        k_tokens: int = PAR_K_TOKENS,
-        tau: float = PAR_TAU,
-        max_retries: int = MAX_RETRIES,
-        m_expansion: int = M_EXPANSION,
-        max_total_branches: int = MAX_TOTAL_BRANCHES,
-        max_steps: int = MAX_STEPS,
-    ) -> str:
-        """
-        Parallel hybrid search similar to `BacktrackAlgoParallel.ipynb`.
-
-        Multiple branches (partial solutions) are explored in parallel:
-        - At each step we expand every active branch by `k_tokens`.
-        - We score all partial answers in *batch* via the PRM.
-        - Good branches continue; bad ones are either split (cloned) or pruned.
-        """
-        print(f"\n--- New Run (parallel): {prompt} ---\n")
-
+    def run_parallel(self, prompt: str) -> str:
+        print(f"\n--- Parallel Run: {prompt[:50]}... ---")
+        
         initial_ids = self.generator.tokenize(prompt)
-        prompt_len = initial_ids.shape[1]
-
-        # Each branch keeps its own ids/cache and retry counter
+        
         active_branches = [
             {
-                "ids": initial_ids,
+                "ids": initial_ids, 
                 "cache": None,
                 "retries": 0,
-                "history": [],
+                "cumulative_score": 1.0,
+                "history": [1.0],
+                "text": ""
             }
         ]
+
         finished_branches = []
         step_count = 0
 
-        while active_branches and step_count < max_steps:
+        while active_branches:
             step_count += 1
-            print(f"\n=== Step {step_count} | Active branches: {len(active_branches)} ===")
+            if step_count > MAX_STEPS:
+                print("Max steps reached.")
+                break
 
-            # 1) Expand all active branches (using generator batch helper)
-            ids_batch = [b["ids"] for b in active_branches]
-            cache_batch = [b["cache"] for b in active_branches]
+            input_tensors = [b["ids"] for b in active_branches]
+            caches = [b["cache"] for b in active_branches]
+            
+            print(f"--- Step {step_count} | Generating for {len(active_branches)} branches... ---")
 
-            step_results = self.generator.generate_step_batch(
-                input_ids_batch=ids_batch,
-                past_key_values_batch=cache_batch,
-                max_new_tokens=k_tokens,
-            )
+            try:
+                # Calls the updated generate_batch_step with fixed mask dtype
+                generated_seqs, new_caches = self.generator.generate_batch_step(
+                    input_tensors, 
+                    caches, 
+                    PAR_K_TOKENS, 
+                    temperature=0.7
+                )
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    print("OOM Error! Clearing cache and reducing branches.")
+                    torch.cuda.empty_cache()
+                    active_branches = active_branches[:1] # Drastic fallback
+                    continue
+                raise e
 
-            # Collect partial answers (text) for PRM scoring
-            partial_texts = []
-            full_ids_list = []
-            new_cache_list = []
-            finished_flags = []
+            # Prepare for Scoring
+            prompts_for_judge = []
+            responses_for_judge = []
+            generated_texts = [] 
 
-            for (full_seq, new_cache, finished_flag), branch in zip(step_results, active_branches):
-                full_ids_list.append(full_seq)
-                new_cache_list.append(new_cache)
-                finished_flags.append(finished_flag)
+            for i, seq in enumerate(generated_seqs):
+                full_text = self.generator.decode(seq[0])
+                generated_texts.append(full_text)
+                
+                prompts_for_judge.append(prompt)
+                
+                # Extract partial response logic
+                decoded_prompt = self.generator.decode(initial_ids[0])
+                if full_text.startswith(decoded_prompt):
+                    r = full_text[len(decoded_prompt):]
+                else:
+                    r = full_text 
+                
+                responses_for_judge.append(r)
 
-                # We always decode from the *original prompt* onward
-                partial_text = self.generator.decode(full_seq[0][prompt_len:])
-                partial_texts.append(partial_text)
-
-            # 2) Score all partial answers in batch
-            qa_pairs = [(prompt, ans) for ans in partial_texts]
-            scores = self.prm.get_scores_batch(qa_pairs)
+            # Scoring
+            torch.cuda.empty_cache() # Help prevent OOM during scoring
+            scores = self.prm.get_scores_batch(list(zip(prompts_for_judge, responses_for_judge)))
 
             next_active_branches = []
 
-            for i, (branch, score, full_ids, new_cache, is_finished) in enumerate(
-                zip(active_branches, scores, full_ids_list, new_cache_list, finished_flags)
-            ):
-                print(f"Branch {i}: score={score:.3f}, retries={branch['retries']}")
+            for i, branch in enumerate(active_branches):
+                score = scores[i]
+                out_seq = generated_seqs[i]
+                full_text = generated_texts[i]
+                
+                prev_len = branch["ids"].shape[1]
+                new_tokens = out_seq[0, prev_len:]
+                
+                is_eos = self.tokenizer.eos_token_id in new_tokens
+                new_text = self.generator.decode(new_tokens)
 
-                # Safety: if the sequence is already too long, treat as finished
-                over_max_len = full_ids.shape[1] > self.max_output_len
-
-                if score > tau:
-                    print(f"  Br {i}: ✅ Pass ({score:.3f})")
-                    if is_finished or over_max_len:
-                        final_text = self.generator.decode(full_ids[0][prompt_len:])
-                        finished_branches.append({"text": final_text, "score": score})
+                if score > PAR_TAU:
+                    print(f"  Br {i}: ✅ Pass ({score:.2f})")
+                    
+                    if is_eos or "###" in new_text or STOP_STRING in new_text: 
+                        finished_branches.append({
+                            "text": full_text, 
+                            "score": score
+                        })
                     else:
-                        next_active_branches.append(
-                            {
-                                "ids": full_ids,
-                                "cache": new_cache,
-                                "retries": 0,
-                                "history": branch["history"] + [score],
-                            }
-                        )
+                        # Remove pads
+                        non_pad = (out_seq[0] != self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+                        if len(non_pad) > 0:
+                            clean_ids = out_seq[0][non_pad[0]:].unsqueeze(0)
+                        else:
+                            clean_ids = out_seq
+                        
+                        next_active_branches.append({
+                            "ids": clean_ids,
+                            "cache": new_caches[i],
+                            "retries": 0,
+                            "cumulative_score": score,
+                            "history": branch["history"] + [score],
+                            "text": full_text
+                        })
                 else:
-                    print(f"  Br {i}: ❌ Fail ({score:.3f})")
-                    if branch["retries"] < max_retries:
-                        # Clone the *previous* state of the branch (before this step)
+                    if branch["retries"] < MAX_RETRIES:
+                        current_total = len(next_active_branches) + len(active_branches) - (i+1)
                         num_clones = 1
-                        if len(next_active_branches) + len(active_branches) < max_total_branches:
-                            num_clones = m_expansion
-
-                        print(
-                            f"  -> Split into {num_clones} clones "
-                            f"(retry {branch['retries'] + 1}/{max_retries})"
-                        )
-
+                        if current_total < MAX_TOTAL_BRANCHES:
+                             num_clones = M_EXPANSION
+                        
+                        print(f"  Br {i}: ❌ Fail ({score:.2f}) -> Split {num_clones}")
+                        
                         for _ in range(num_clones):
-                            next_active_branches.append(
-                                {
-                                    "ids": branch["ids"],
-                                    "cache": branch["cache"],
-                                    "retries": branch["retries"] + 1,
-                                    "history": branch["history"],
-                                }
-                            )
+                            next_active_branches.append({
+                                "ids": branch["ids"],
+                                "cache": branch["cache"],
+                                "retries": branch["retries"] + 1,
+                                "cumulative_score": branch["cumulative_score"],
+                                "history": branch["history"],
+                                "text": branch["text"]
+                            })
                     else:
-                        print(f"  Br {i}: 💀 Pruned (max retries reached)")
+                        print(f"  Br {i}: 💀 Pruned")
 
-            # Respect global cap on the number of branches
-            if len(next_active_branches) > max_total_branches:
-                next_active_branches = next_active_branches[:max_total_branches]
+            # Pruning
+            if len(next_active_branches) > MAX_TOTAL_BRANCHES:
+                next_active_branches.sort(key=lambda x: x["cumulative_score"], reverse=True)
+                next_active_branches = next_active_branches[:MAX_TOTAL_BRANCHES]
 
             active_branches = next_active_branches
+            
+            if not active_branches and not finished_branches:
+                return "Failed to generate a solution."
 
         if not finished_branches:
+            if active_branches:
+                 best = max(active_branches, key=lambda x: x["cumulative_score"])
+                 return best["text"]
             return "Failed."
 
-        # Pick the best finished branch by its final PRM score
         best = max(finished_branches, key=lambda x: x["score"])
         print(f"=> Winner: {best['score']:.3f}")
         return best["text"]
@@ -232,7 +235,6 @@ def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
     print("--- Loading GSM8K Dataset ---")
     dataset = load_dataset("openai/gsm8k", "main", split="test")
 
-    # Select random samples
     indices = random.sample(range(len(dataset)), NUM_SAMPLES)
     samples = [dataset[i] for i in indices]
 
@@ -260,18 +262,9 @@ if __name__ == "__main__":
         model_name="Qwen/Qwen3-4B", 
     )
     
-    # prm = LogitPRM(
-    #     model_name="RLHFlow/Llama3.1-8B-PRM-Deepseek-Data", 
-    # )
-
     prm = CustomPRM(
         model_name="Qwen/Qwen3-4B",
     )
 
     searcher = HybridSearcher(generator, prm)
-
-    # Sequential:
-    # test_gsm8k(searcher, use_parallel=False)
-
-    # Parallel:
     test_gsm8k(searcher, use_parallel=True)

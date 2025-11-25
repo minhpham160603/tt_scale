@@ -55,7 +55,8 @@ class AbstractGenerator(ABC):
         """
         pass
     
-    def generate_step_batch(
+    @abstractmethod
+    def generate_batch_step(
         self,
         input_ids_batch: List[Any],
         past_key_values_batch: List[Optional[Any]],
@@ -80,18 +81,7 @@ class AbstractGenerator(ABC):
         Returns:
             List of tuples ``(full_sequence, new_cache, finished)`` – one per branch.
         """
-        results: List[Tuple[Any, Any, bool]] = []
-        # Fallback: run each branch sequentially
-        for input_ids, cache in zip(input_ids_batch, past_key_values_batch):
-            full_seq, new_cache, finished = self.generate_step(
-                input_ids=input_ids,
-                past_key_values=cache,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                stop_strings=stop_strings,
-            )
-            results.append((full_seq, new_cache, finished))
-        return results
+        pass
 
 
 # ==========================================
@@ -133,16 +123,3 @@ class AbstractPRM(ABC):
         """
         pass
     
-    @abstractmethod
-    def get_scores_batch(self, qa_pairs: List[Tuple[str, str]]) -> List[float]:
-        """
-        Scores a batch of (question, partial_answer) tuples.
-        This allows implementations to optimize batch inference (e.g. via vLLM or padding).
-
-        Args:
-            qa_pairs: A list of tuples, where each tuple is (question, partial_answer).
-
-        Returns:
-            List[float]: A list of scores corresponding to the input pairs.
-        """
-        pass
