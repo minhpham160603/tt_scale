@@ -4,7 +4,7 @@ from datasets import load_dataset
 from .prm.custom_prm import CustomPRM
 from .generator.custom_generator import Generator
 from .generator.backtrack_generator import BacktrackGenerator
-from .prm.logits_prm import LogitPRM
+from .prm.logits_prm import LogitsPRM
 from transformers import BitsAndBytesConfig
 import torch
 from .base_classes import AbstractGenerator, AbstractPRM

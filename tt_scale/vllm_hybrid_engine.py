@@ -3,15 +3,20 @@ import torch
 import re
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
+from tt_scale.prm.logits_prm import LogitsPRM
+from tt_scale.prm.vllm_cot_prm import VLLMCoTPRM
 
 # --- Configuration ---
 MODEL_NAME = "Qwen/Qwen3-4B" # "Qwen/Qwen3-4B"
-K_TOKENS = 64          
-TAU = 0.5              
+K_TOKENS = 100          
+TAU = 0.6              
 MAX_BACKTRACKS = 3     
-NUM_SAMPLES = 3        
+NUM_SAMPLES = 50        
 FINAL_ANSWER_PREFIX = "<FINAL>"
-
+DEBUG = False
+VERBOSE = True 
+EPSILON = 1e-3
+SEED = 69
 # ==========================================
 # 1. VLLM Generator Wrapper
 # ==========================================
@@ -36,7 +41,6 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         messages = [
             {"role": "system", "content": self.SYS_PROMPT},
             {"role": "user", "content": question},
-            {"role": "assistant", "content": partial_answer}
         ]
         
         # 2. Apply Template (add_generation_prompt=True adds the Assistant header)
@@ -47,6 +51,13 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
             add_generation_prompt=True,
             enable_thinking=False
         )
+
+        context_prefix += partial_answer
+
+        # if DEBUG:
+        #     print(">>>>>>>>>>>>>>>>>>>>>")
+        #     print("INPUT_CONTEXT:", context_prefix)
+        #     print("<<<<<<<<<<<<<<<<<<<<<")
         
         # 3. Append the partial answer so far (Prefilling)
         # vLLM will see this as the assistant having already typed this much
@@ -57,12 +68,13 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         """
         Generates the next step given the full context.
         """
-        temp = 0.9 + (0.1 * retry_attempt)
+        temp = 1 + (0.5 * retry_attempt)
         
         params = SamplingParams(
             temperature=temp,
             max_tokens=K_TOKENS,
-            stop=[self.stop_token], 
+            top_p=0.9,
+            top_k=40, 
         )
 
         # vLLM automatically uses Prefix Caching here.
@@ -70,16 +82,16 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         # Since 'partial_answer' grows, vLLM caches the shared prefix of the answer.
         outputs = self.llm.generate([full_context], params, use_tqdm=False)
         new_text = outputs[0].outputs[0].text
-        
-        # Check stop reason
         finish_reason = outputs[0].outputs[0].finish_reason
-        cleaned_text = new_text.replace(self.stop_token, "").strip()
-        
-        # It is finished if it stopped naturally (EOS) or hit our stop token
         is_eos = (finish_reason == "stop" and self.stop_token not in new_text)
-        print("Finish Reason:", finish_reason, "| Is EOS:", is_eos)
+
+        if DEBUG:
+            print(">>>>>>>>>>>>>>>>>>>>")
+            print("GEN_STEP: ", new_text)
+            print("<<<<<<<<<<<<<<<<<<<<")
+            print("Finish Reason:", finish_reason, "| Is EOS:", is_eos)
         
-        return cleaned_text, is_eos
+        return new_text, is_eos
 
 # ==========================================
 # 2. VLLM PRM Wrapper
@@ -155,61 +167,95 @@ class HybridSearcher:
                 checkpoints.pop()
                 continue
                 
-            if FINAL_ANSWER_PREFIX in new_chunk:
-                finished = True
-
             # 3. Score
-            full_answer_candidate = current_generated + " " + new_chunk
+            full_answer_candidate = current_generated + new_chunk
             score = self.prm.get_score(raw_prompt, full_answer_candidate)
-            
-            print_chunk = new_chunk.replace('\n', ' ')
 
-            if score >= TAU:
-                print(f"  -> KEEP (Score {score:.2f}) | {print_chunk}...")
-                checkpoints.append((current_generated + " " + new_chunk, 0))
-                if is_eos: finished = True
-            else:
-                print(f"  -> REJECT (Score {score:.2f}) | {print_chunk}...")
-                
-                if bt_count < MAX_BACKTRACKS:
-                    _, old_bt = checkpoints.pop()
-                    checkpoints.append((current_generated, old_bt + 1))
-                    print(f"     Retrying... ({old_bt + 1}/{MAX_BACKTRACKS})")
+            if score >= TAU or bt_count >= MAX_BACKTRACKS:
+                if score >= TAU:
+                    print(f"  -> KEEP (Score {score:.2f})")
                 else:
-                    print("     MAX RETRIES. Forced accept.")
-                    checkpoints.append((current_generated + " " + new_chunk, 0))
-
+                    print(f"  -> FORCE KEEP (Score {score:.2f})")
+                checkpoints.append((full_answer_candidate, 0))
+                if is_eos or (FINAL_ANSWER_PREFIX in new_chunk):
+                    finished = True
+            else:
+                print(f"  -> REJECT (Score {score:.2f})")
+                checkpoints.pop()
+                checkpoints.append((current_generated, bt_count + 1))
+                print(f"     Retrying... ({bt_count + 1}/{MAX_BACKTRACKS})")
             final_response = checkpoints[-1][0]
-
         return final_response
 
 # ==========================================
 # 4. Execution
 # ==========================================
+def extract_result(text):
+    # Regex pattern explanation:
+    # r"..." : Raw string literal
+    # <FINAL>\s* : Matches the literal '<FINAL>' followed by zero or more whitespace characters
+    # ([\d\.]+) : Capturing Group 1. Matches one or more digits (\d) or decimal points (\.).
+    # $ : Asserts position at the end of the string (optional, but good for cleanup)
+    
+    # We use \s* to handle potential extra spaces/newlines between <FINAL> and the score.
+    pattern = r"<FINAL>\s*([\d\.]+)"
+    match = re.search(pattern, text, re.MULTILINE)
+    if match:
+        try:
+            score_str = match.group(1)
+            return float(score_str)
+        except ValueError:
+            print(f"Warning: Could not convert '{score_str}' to float.")
+            return None
+    return None
+
+
 def test_gsm8k(searcher):
     dataset = load_dataset("openai/gsm8k", "main", split="test")
+    random.seed(SEED)
     indices = random.sample(range(len(dataset)), NUM_SAMPLES)
-    
+    correct = 0
     for i in indices:
         sample = dataset[i]
         print(f"\n\n=== Question: {sample['question']} ===")
-        result = searcher.run(sample['question'])
-        print(f"\n[Generated]: {result.strip()}")
-        print(f"[Truth]:     {sample['answer']}")
+        output_text = searcher.run(sample['question'])
+        answer = extract_result(output_text)
 
-if __name__ == "__main__":
+        idx = sample['answer'].find("####")
+        if idx == -1:
+            print("Warning: Could not find '####' in ground truth answer.", sample['answer'])
+            continue
+        if answer is None:
+            continue
+        truth_answer = float(sample['answer'][idx+4:].strip())
+        correct += abs(answer - truth_answer) < EPSILON
+        if VERBOSE:
+            print(f"\n[Generated]: {output_text.strip()}")
+            print(f"[Truth]:     {sample['answer']}")
+        else:
+            print(f"[Generated Answer]: {answer} | [Truth Answer]: {truth_answer}")
+
+    print(f"\n\n=== GSM8K Results: {correct}/{NUM_SAMPLES} correct ===")
+
+
+def main():
     print("Initializing vLLM Engine...")
     engine = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.6,
         trust_remote_code=True,
         dtype="float16",
-        max_model_len=8096,
+        max_model_len=16384,
     )
 
     gen = VLLMGenerator(engine)
-    prm = VLLMPRM(engine)
+    # prm = VLLMPRM(engine)
+    # prm = LogitsPRM()
+    prm = VLLMCoTPRM(engine)
     
     searcher = HybridSearcher(gen, prm, 512)
     test_gsm8k(searcher)
+
+if __name__ == "__main__":
+    main()

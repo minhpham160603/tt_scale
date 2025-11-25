@@ -7,12 +7,7 @@ from transformers import (
 )
 
 # --- Configuration ---
-GENERATOR_NAME = "Qwen/Qwen2.5-Math-1.5B"
-VERIFIER_NAME = "RLHFlow/Llama3.1-8B-PRM-Deepseek-Data"
-K_TOKENS = 40
-TAU = 0.7
-MAX_BACKTRACKS = 3
-NUM_SAMPLES = 10
+DEFAULT_MODEL = "RLHFlow/Llama3.1-8B-PRM-Deepseek-Data"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 bnb_config = BitsAndBytesConfig(
@@ -21,12 +16,12 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4"
 )
 
-class LogitPRM(AbstractPRM):
+class LogitsPRM(AbstractPRM):
     """
     Wraps a Process Reward Model that scores based on the log-probability 
     of specific tokens (e.g., "+" vs "-").
     """
-    def __init__(self, model_name, device="cuda", quantization_config=bnb_config):
+    def __init__(self, model_name=DEFAULT_MODEL, device="cuda", quantization_config=bnb_config):
         print(f"Loading Verifier [{model_name}]...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
