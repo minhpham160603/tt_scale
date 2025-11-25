@@ -54,6 +54,44 @@ class AbstractGenerator(ABC):
             4. new_text (str): The decoded text of *only* the new tokens generated.
         """
         pass
+    
+    def generate_step_batch(
+        self,
+        input_ids_batch: List[Any],
+        past_key_values_batch: List[Optional[Any]],
+        max_new_tokens: int,
+        temperature: float = 0.7,
+        stop_strings: Optional[List[str]] = None,
+    ) -> List[Tuple[Any, Any, bool]]:
+        """
+        Convenience helper for generating a step for *multiple* branches in parallel.
+
+        The default implementation simply loops over the batch and calls
+        :meth:`generate_step` for each element. Concrete generators can override
+        this method to use a more efficient batched implementation.
+
+        Args:
+            input_ids_batch: List of inputs for each branch.
+            past_key_values_batch: List of KV-caches (or ``None``) for each branch.
+            max_new_tokens: Maximum number of tokens to generate per branch.
+            temperature: Sampling temperature.
+            stop_strings: Optional list of stop strings.
+
+        Returns:
+            List of tuples ``(full_sequence, new_cache, finished)`` – one per branch.
+        """
+        results: List[Tuple[Any, Any, bool]] = []
+        # Fallback: run each branch sequentially
+        for input_ids, cache in zip(input_ids_batch, past_key_values_batch):
+            full_seq, new_cache, finished = self.generate_step(
+                input_ids=input_ids,
+                past_key_values=cache,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stop_strings=stop_strings,
+            )
+            results.append((full_seq, new_cache, finished))
+        return results
 
 
 # ==========================================
@@ -81,6 +119,20 @@ class AbstractPRM(ABC):
         """
         pass
 
+    @abstractmethod
+    def get_scores_batch(self, qa_pairs: List[Tuple[str, str]]) -> List[float]:
+        """
+        Scores a batch of (question, partial_answer) tuples.
+        This allows implementations to optimize batch inference (e.g. via vLLM or padding).
+
+        Args:
+            qa_pairs: A list of tuples, where each tuple is (question, partial_answer).
+
+        Returns:
+            List[float]: A list of scores corresponding to the input pairs.
+        """
+        pass
+    
     @abstractmethod
     def get_scores_batch(self, qa_pairs: List[Tuple[str, str]]) -> List[float]:
         """

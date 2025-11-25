@@ -1,4 +1,3 @@
-
 from ..base_classes import AbstractGenerator
 import torch 
 from transformers import (
@@ -6,7 +5,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer
 )
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,7 +51,14 @@ class BacktrackGenerator(AbstractGenerator):
     def decode(self, token_ids):
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-    def generate_step(self, input_ids, past_key_values, max_new_tokens, temperature=0.7):
+    def generate_step(
+        self,
+        input_ids,
+        past_key_values,
+        max_new_tokens,
+        temperature: float = 0.7,
+        stop_strings=None,
+    ):
         # 1. Generate
         with torch.no_grad():
             outputs = self.model.generate(
@@ -65,8 +70,9 @@ class BacktrackGenerator(AbstractGenerator):
                 return_dict_in_generate=True,
                 use_cache=True,
                 pad_token_id=self.tokenizer.eos_token_id,
-                stop_strings=[STOP_STRING],
-                tokenizer=self.tokenizer
+                # If no stop_strings are passed, default to the internal STOP_STRING
+                stop_strings=stop_strings or [STOP_STRING],
+                tokenizer=self.tokenizer,
             )
         
         full_sequence = outputs.sequences
@@ -75,14 +81,16 @@ class BacktrackGenerator(AbstractGenerator):
         # 3. Extract new text to check for stop strings/EOS
         input_len = input_ids.shape[1]
         new_tokens = full_sequence[0][input_len:]
+
         # 4. Determine if finished
         finished = False
-        
         if self.tokenizer.eos_token_id in new_tokens:
             finished = True
 
-        print("DEBUG Generated Tokens:", 
-              self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
+        print(
+            "DEBUG Generated Tokens:",
+            self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip(),
+        )
 
         return full_sequence, self._trim_cache(past_key_values), finished
 
@@ -100,4 +108,4 @@ class BacktrackGenerator(AbstractGenerator):
             trimmed_key = key_state[:, :, :-1, :]
             trimmed_value = value_state[:, :, :-1, :]
             new_kv.append((trimmed_key, trimmed_value))
-        return tuple(new_kv) # DynamicCache(new_kv)
+        return tuple(new_kv)  # DynamicCache(new_kv)
