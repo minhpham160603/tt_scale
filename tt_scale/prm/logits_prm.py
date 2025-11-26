@@ -8,6 +8,7 @@ from transformers import (
 
 # --- Configuration ---
 DEFAULT_MODEL = "RLHFlow/Llama3.1-8B-PRM-Deepseek-Data"
+# DEFAULT_MODEL = "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-7B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 bnb_config = BitsAndBytesConfig(
@@ -18,7 +19,7 @@ bnb_config = BitsAndBytesConfig(
 
 class LogitsPRM(AbstractPRM):
     """
-    Wraps a Process Reward Model that scores based on the log-probability 
+    Wraps a Process Reward Model that scores based on the log-probability
     of specific tokens (e.g., "+" vs "-").
     """
     def __init__(self, model_name=DEFAULT_MODEL, device="cuda", quantization_config=bnb_config):
@@ -32,7 +33,7 @@ class LogitsPRM(AbstractPRM):
             trust_remote_code=True,
         ).eval()
         self.device = device
-        
+
         self.plus_tag_id = self.tokenizer.encode("+")[-1]
         self.minus_tag_id = self.tokenizer.encode("-")[-1]
         self.candidate_tokens = [self.plus_tag_id, self.minus_tag_id]
@@ -45,13 +46,13 @@ class LogitsPRM(AbstractPRM):
             {"role": "user", "content": prompt_text + partial_response_text},
             {"role": "assistant", "content": "+"}
         ]
-        
+
         formatted_input = self.tokenizer.apply_chat_template(
-            chat, 
-            tokenize=False, 
+            chat,
+            tokenize=False,
             add_generation_prompt=False
         )
-        
+
         inputs = self.tokenizer.encode(
             formatted_input,
             return_tensors="pt"
@@ -60,15 +61,15 @@ class LogitsPRM(AbstractPRM):
         with torch.no_grad():
             outputs = self.model(input_ids=inputs)
             logits = outputs.logits[:, -3, self.candidate_tokens]
-            prob = logits.softmax(dim=-1)[:, 0] 
+            prob = logits.softmax(dim=-1)[:, 0]
             score = prob.cpu().tolist()[0]
 
         # Debug print
         display_text = partial_response_text.replace("\n", " ")[-40:]
         print(f"  [Verifier] Raw Score: {score:.3f} | ...{display_text}")
-        
+
         return score
-    
+
     def get_scores_batch(self, qa_pairs: list[tuple[str, str]]) -> list[float]:
             """
             Implementation of the abstract method.
