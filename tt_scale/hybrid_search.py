@@ -1,6 +1,7 @@
 import random
 from datasets import load_dataset
 import torch
+import math
 
 from .prm.custom_prm import CustomPRM
 from .generator.custom_generator import Generator
@@ -21,9 +22,10 @@ NUM_SAMPLES = 3
 # Parallel hybrid search
 PAR_K_TOKENS = 20
 PAR_TAU = 0.4
-MAX_RETRIES = 5            
+MAX_RETRIES = 3            
 M_EXPANSION = 3            
-MAX_TOTAL_BRANCHES = 8     
+MAX_TOTAL_BRANCHES = 6  
+KEEPING_BRANCHES = 2
 MAX_STEPS = 30             
 
 
@@ -100,13 +102,28 @@ class HybridSearcher:
 
         finished_branches = []
         step_count = 0
+        retries = 0
+        jumping = False
 
         while active_branches:
+            
             step_count += 1
             if step_count > MAX_STEPS:
                 print("Max steps reached.")
                 break
-
+            cloned_branches = []
+            clone_times = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
+            for branch in active_branches:
+                for _ in range(clone_times):
+                    cloned_branches.append({
+                        "ids": branch["ids"],
+                        "cache": branch["cache"],
+                        "retries": branch["retries"],
+                        "cumulative_score": branch["cumulative_score"],
+                        "history": branch["history"][:],
+                        "text": branch["text"]
+                    })
+            active_branches = cloned_branches
             input_tensors = [b["ids"] for b in active_branches]
             caches = [b["cache"] for b in active_branches]
             
@@ -118,8 +135,10 @@ class HybridSearcher:
                     input_tensors, 
                     caches, 
                     PAR_K_TOKENS, 
-                    temperature=0.7
+                    temperature=0.7,
+                    # num_return_sequences= max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
                 )
+                # print(f"  -> Generated {len(generated_seqs)} sequences.")
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     print("OOM Error! Clearing cache and reducing branches.")
@@ -153,6 +172,14 @@ class HybridSearcher:
             scores = self.prm.get_scores_batch(list(zip(prompts_for_judge, responses_for_judge)))
 
             next_active_branches = []
+            retry_branches = []
+            passing_branches = []
+            passing = 0
+            if jumping:
+                passing_threshold = 0.0
+                jumping = False
+            else:
+                passing_threshold = PAR_TAU
 
             for i, branch in enumerate(active_branches):
                 score = scores[i]
@@ -165,8 +192,9 @@ class HybridSearcher:
                 is_eos = self.tokenizer.eos_token_id in new_tokens
                 new_text = self.generator.decode(new_tokens)
 
-                if score > PAR_TAU:
+                if score > passing_threshold:
                     print(f"  Br {i}: ✅ Pass ({score:.2f})")
+                    passing += 1
                     
                     if is_eos or "###" in new_text or STOP_STRING in new_text: 
                         finished_branches.append({
@@ -181,7 +209,7 @@ class HybridSearcher:
                         else:
                             clean_ids = out_seq
                         
-                        next_active_branches.append({
+                        passing_branches.append({
                             "ids": clean_ids,
                             "cache": new_caches[i],
                             "retries": 0,
@@ -190,32 +218,40 @@ class HybridSearcher:
                             "text": full_text
                         })
                 else:
-                    if branch["retries"] < MAX_RETRIES:
-                        current_total = len(next_active_branches) + len(active_branches) - (i+1)
-                        num_clones = 1
-                        if current_total < MAX_TOTAL_BRANCHES:
-                             num_clones = M_EXPANSION
-                        
-                        print(f"  Br {i}: ❌ Fail ({score:.2f}) -> Split {num_clones}")
-                        
-                        for _ in range(num_clones):
-                            next_active_branches.append({
-                                "ids": branch["ids"],
-                                "cache": branch["cache"],
-                                "retries": branch["retries"] + 1,
-                                "cumulative_score": branch["cumulative_score"],
-                                "history": branch["history"],
-                                "text": branch["text"]
-                            })
-                    else:
-                        print(f"  Br {i}: 💀 Pruned")
+                    print(f"  Br {i}: ❌ Fail ({score:.2f})")
+                    retry_branches.append(branch)
+                    
 
-            # Pruning
-            if len(next_active_branches) > MAX_TOTAL_BRANCHES:
-                next_active_branches.sort(key=lambda x: x["cumulative_score"], reverse=True)
-                next_active_branches = next_active_branches[:MAX_TOTAL_BRANCHES]
+            # if enough passing branches, not backtracking, and prune to KEEPING_BRANCHES
+            if passing >= KEEPING_BRANCHES:
+                print(f"  -> Sufficient passing branches ({passing}), pruning to {KEEPING_BRANCHES}.")
+                passing_branches.sort(key=lambda x: x["cumulative_score"], reverse=True)
+                active_branches = passing_branches[:KEEPING_BRANCHES]
+                retries = 0  
 
-            active_branches = next_active_branches
+
+            else:
+                print(f"  -> Insufficient passing branches ({passing}), backtracking.")
+
+                backtrack_candidates = passing_branches + retry_branches[:KEEPING_BRANCHES - passing]
+                
+                active_branches = []
+                for b in backtrack_candidates:
+                    active_branches.append({
+                        "ids": b["ids"],
+                        "cache": b["cache"],
+                        "retries": b["retries"] + 1,
+                        "cumulative_score": b["cumulative_score"],
+                        "history": b["history"],
+                        "text": b["text"]
+                    })
+                retries += 1
+                if retries > MAX_RETRIES:
+                    print("  -> Max retries reached, forcing jumping")
+                    jumping = True
+
+                    
+
             
             if not active_branches and not finished_branches:
                 return "Failed to generate a solution."
@@ -229,6 +265,7 @@ class HybridSearcher:
         best = max(finished_branches, key=lambda x: x["score"])
         print(f"=> Winner: {best['score']:.3f}")
         return best["text"]
+    
 
 
 def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
@@ -259,11 +296,11 @@ def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
 
 if __name__ == "__main__":
     generator = BacktrackGenerator(
-        model_name="Qwen/Qwen3-4B", 
+        model_name="Qwen/Qwen3-0.6B", 
     )
     
     prm = CustomPRM(
-        model_name="Qwen/Qwen3-4B",
+        model_name="Qwen/Qwen3-0.6B",
     )
 
     searcher = HybridSearcher(generator, prm)

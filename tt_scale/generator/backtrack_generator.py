@@ -178,7 +178,7 @@ class BacktrackGenerator(AbstractGenerator):
         new_cache.value_cache = batched_vals
         return new_cache
 
-    def generate_batch_step(self, input_ids_list, past_key_values_list, max_new_tokens, temperature=0.7):
+    def generate_batch_step(self, input_ids_list, past_key_values_list, max_new_tokens, temperature=0.7,num_return_sequences=1):
         # 1. Reset if inconsistent
         if any(c is None for c in past_key_values_list):
              past_key_values_list = [None] * len(input_ids_list)
@@ -222,6 +222,7 @@ class BacktrackGenerator(AbstractGenerator):
                 do_sample=True,
                 temperature=temperature,
                 pad_token_id=self.tokenizer.pad_token_id,
+                # num_return_sequences=num_return_sequences
             )
 
         generated_seqs = outputs.sequences
