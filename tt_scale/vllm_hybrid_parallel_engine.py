@@ -13,7 +13,7 @@ MODEL_NAME = "Qwen/Qwen3-0.6B" # "Qwen/Qwen3-4B"
 K_TOKENS = 100          
 TAU = 0.6              
 MAX_BACKTRACKS = 3     
-NUM_SAMPLES = 50        
+NUM_SAMPLES = 20        
 FINAL_ANSWER_PREFIX = "<FINAL>"
 DEBUG = False
 VERBOSE = True 
@@ -22,8 +22,8 @@ SEED = 69
 
 
 # Parallel hybrid search
-PAR_K_TOKENS = 20
-PAR_TAU = 0.4
+PAR_K_TOKENS = 100
+PAR_TAU = 0.6
 MAX_RETRIES = 3            
 M_EXPANSION = 3            
 MAX_TOTAL_BRANCHES = 6  
@@ -77,7 +77,7 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         
         return context_prefix
 
-    def generate_step(self, full_context, retry_attempt=0):
+    def generate_step(self, full_context, retry_attempt=0, M_EXPANSION=1):
         """
         Generates the next step given the full context.
         """
@@ -88,23 +88,31 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
             max_tokens=K_TOKENS,
             top_p=0.9,
             top_k=40, 
+            n = M_EXPANSION,
+            stop=[self.stop_token],
         )
 
         # vLLM automatically uses Prefix Caching here.
         # Since 'context_prefix' (System+User) is constant, it is cached.
         # Since 'partial_answer' grows, vLLM caches the shared prefix of the answer.
         outputs = self.llm.generate([full_context], params, use_tqdm=False)
-        new_text = outputs[0].outputs[0].text
-        finish_reason = outputs[0].outputs[0].finish_reason
-        is_eos = (finish_reason == "stop" and self.stop_token not in new_text)
+        result = []
+        for out in outputs[0].outputs:
+            new_text = out.text
+            finish_reason = out.finish_reason
+            is_eos = (finish_reason == "stop" and self.stop_token not in new_text)
+            result.append((new_text, is_eos))
+        # new_text = outputs[0].outputs[0].text
+        # finish_reason = outputs[0].outputs[0].finish_reason
+        # is_eos = (finish_reason == "stop" and self.stop_token not in new_text)
 
-        if DEBUG:
-            print(">>>>>>>>>>>>>>>>>>>>")
-            print("GEN_STEP: ", new_text)
-            print("<<<<<<<<<<<<<<<<<<<<")
-            print("Finish Reason:", finish_reason, "| Is EOS:", is_eos)
+            if DEBUG:
+                print(">>>>>>>>>>>>>>>>>>>>")
+                print("GEN_STEP: ", new_text)
+                print("<<<<<<<<<<<<<<<<<<<<")
+                print("Finish Reason:", finish_reason, "| Is EOS:", is_eos)
         
-        return new_text, is_eos
+        return result
 
 # ==========================================
 # 2. VLLM PRM Wrapper
@@ -206,7 +214,8 @@ class HybridSearcher:
         
         active_branches = [
             {
-                "cumulative_score": 1.0,
+                "score": 0.0,
+                "average_score": 0.0, # for sorting pruning when backtracking
                 "checkpoint": [],
                 "finished": False,
             }
@@ -224,21 +233,20 @@ class HybridSearcher:
             if step_count > MAX_STEPS:
                 print("Max steps reached.")
                 break
-            cloned_branches = []
-            clone_times = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
-            for branch in active_branches:
-                for _ in range(clone_times):
-                    cloned_branches.append({
-                        "cumulative_score": branch["cumulative_score"],
-                        "checkpoint": branch["checkpoint"].copy(),
-                        "finished": branch["finished"],
-                    })
-            active_branches = cloned_branches
+            # cloned_branches = []
+            # clone_times = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
+            # for branch in active_branches:
+            #     for _ in range(clone_times):
+            #         cloned_branches.append({
+            #             "cumulative_score": branch["cumulative_score"],
+            #             "checkpoint": branch["checkpoint"].copy(),
+            #             "finished": branch["finished"],
+            #         })
+            # active_branches = cloned_branches
             
             print(f"--- Step {step_count} | Generating for {len(active_branches)} branches... ---")
             
             next_active_branches = []
-            retry_branches = []
             passing_branches = []
             passing = 0
             if jumping:
@@ -247,7 +255,7 @@ class HybridSearcher:
             else:
                 passing_threshold = PAR_TAU
 
-
+            m_expansion = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
             for i,branch in enumerate(active_branches):
                 try:
                     if branch["finished"]:
@@ -256,7 +264,9 @@ class HybridSearcher:
                     current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
                     full_gen_context = self.gen.build_input_context(prompt, current_generated)
                     
-                    new_chunk, is_eos = self.gen.generate_step(full_gen_context, retry_attempt=retries)
+                    outputs = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=m_expansion)
+                    
+                    # new_chunk, is_eos = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=M_EXPANSION)
                     
                     # if not new_chunk:
                     #     if is_eos: 
@@ -272,50 +282,54 @@ class HybridSearcher:
                         continue
                     raise e
 
-                full_answer_candidate = current_generated + new_chunk
-                score = self.prm.get_score(prompt, full_answer_candidate)
-                branch["cumulative_score"] = score
+                for j, (new_chunk, is_eos) in enumerate(outputs):
+                    full_answer_candidate = current_generated + new_chunk
+                    score = self.prm.get_score(prompt, full_answer_candidate)
+                    branch["average_score"]  += score
 
-                if branch["cumulative_score"] > passing_threshold:
-                    print(f"  Br {i}: ✅ Pass ({score:.2f})")
-                    passing += 1
-                    
-                    if is_eos or (FINAL_ANSWER_PREFIX in new_chunk): 
-                        finished_branches.append({
-                            "text": full_answer_candidate,
-                            "score": branch["cumulative_score"],
-                            "finished": True
-                        })
+                    if score > passing_threshold:
+                        print(f"  Br {i},{j}: ✅ Pass ({score:.2f})")
+                        passing += 1
+                        
+                        if is_eos or (FINAL_ANSWER_PREFIX in new_chunk): 
+                            finished_branches.append({
+                                "text": full_answer_candidate,
+                                "score": branch["score"],
+                                "finished": True
+                            })
+                        else:
+                            passing_branches.append({
+                                "score": score,
+                                "checkpoint": [full_answer_candidate],
+                                "finished": False,
+                                "average_score": 0.0,
+                                "text": full_answer_candidate,
+                            })
                     else:
-                        passing_branches.append({
-                            "cumulative_score": score,
-                            "checkpoint": [full_answer_candidate],
-                            "finished": False
-                        })
-                else:
-                    print(f"  Br {i}: ❌ Fail ({score:.2f})")
-                    retry_branches.append(branch)
-                    
+                        print(f"  Br {i},{j}: ❌ Fail ({score:.2f})")
+                        
 
             # if enough passing branches, not backtracking, and prune to KEEPING_BRANCHES
             if passing >= KEEPING_BRANCHES:
                 print(f"  -> Sufficient passing branches ({passing}), pruning to {KEEPING_BRANCHES}.")
-                passing_branches.sort(key=lambda x: x["cumulative_score"], reverse=True)
+                passing_branches.sort(key=lambda x: x["score"], reverse=True)
                 active_branches = passing_branches[:KEEPING_BRANCHES]
                 retries = 0  
 
 
             else:
                 print(f"  -> Insufficient passing branches ({passing}), backtracking.")
-
-                backtrack_candidates = passing_branches + retry_branches[:KEEPING_BRANCHES - passing]
+                active_branches.sort(key=lambda x: x["average_score"], reverse=True)
+                # keep only top half for backtracking
+                backtrack_candidates = active_branches[:math.ceil(MAX_TOTAL_BRANCHES/2)]
                 
                 active_branches = []
                 for b in backtrack_candidates:
                     active_branches.append({
-                        "cumulative_score": b["cumulative_score"],
+                        "score": b["score"],
                         "checkpoint": b["checkpoint"],
                         "finished": b["finished"],
+                        "average_score": 0.0,
                     })
                 retries += 1
                 if retries > MAX_RETRIES:
@@ -330,8 +344,13 @@ class HybridSearcher:
 
         if not finished_branches:
             if active_branches:
-                 best = max(active_branches, key=lambda x: x["cumulative_score"])
-                 return best["text"]
+                best = max(active_branches, key=lambda x: x["score"])
+                if best["checkpoint"]:
+                    return best["checkpoint"][-1]
+                elif "text" in best:
+                    return best["text"]
+                else:
+                    return "Failed."
             return "Failed."
 
         best = max(finished_branches, key=lambda x: x["score"])
