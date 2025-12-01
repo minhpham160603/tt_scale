@@ -12,6 +12,9 @@ dependencies = [
     "torch",
     "transformers",
     "datasets",
+    "bitsandbytes",
+    "accelerate",
+    "vllm"
 ]
 
 [tool.setuptools]

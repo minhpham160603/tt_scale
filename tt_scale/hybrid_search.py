@@ -2,6 +2,9 @@ import random
 from datasets import load_dataset
 import torch
 import math
+import random
+from datasets import load_dataset
+import re
 
 from .prm.custom_prm import CustomPRM
 from .generator.custom_generator import Generator
@@ -13,11 +16,12 @@ from .base_classes import AbstractGenerator, AbstractPRM
 # ==========================================
 
 # Sequential hybrid search
-K_TOKENS = 64          
+K_TOKENS = 256          
 TAU = 0.5              
 MAX_BACKTRACKS = 3     
 
-NUM_SAMPLES = 3        
+NUM_SAMPLES = 5    
+SEED = 45
 
 # Parallel hybrid search
 PAR_K_TOKENS = 20
@@ -26,7 +30,10 @@ MAX_RETRIES = 3
 M_EXPANSION = 3            
 MAX_TOTAL_BRANCHES = 6  
 KEEPING_BRANCHES = 2
-MAX_STEPS = 30             
+MAX_STEPS = 10        
+EPSILON = 1e-3     
+
+
 
 
 class HybridSearcher:
@@ -135,7 +142,7 @@ class HybridSearcher:
                     input_tensors, 
                     caches, 
                     PAR_K_TOKENS, 
-                    temperature=0.7,
+                    temperature=0.7 + 0.2 * retries,
                     # num_return_sequences= max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
                 )
                 # print(f"  -> Generated {len(generated_seqs)} sequences.")
@@ -268,30 +275,154 @@ class HybridSearcher:
     
 
 
-def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
-    print("--- Loading GSM8K Dataset ---")
+# def extract_answer_number(text):
+#     """Extracts the number after ### or the last number in text."""
+#     if not text: return None
+#     match = re.search(r'###\s*(-?[\d,]+(?:\.\d+)?)', text)
+#     if match:
+#         try: return float(match.group(1).replace(',', ''))
+#         except: pass
+#     numbers = re.findall(r'-?[\d,]+(?:\.\d+)?', text)
+#     if numbers:
+#         try: return float(numbers[-1].replace(',', ''))
+#         except: pass
+#     return None
+
+# def extract_result(text):
+#     # Regex pattern explanation:
+#     # r"..." : Raw string literal
+#     # <FINAL>\s* : Matches the literal '<FINAL>' followed by zero or more whitespace characters
+#     # ([\d\.]+) : Capturing Group 1. Matches one or more digits (\d) or decimal points (\.).
+#     # $ : Asserts position at the end of the string (optional, but good for cleanup)
+    
+#     # We use \s* to handle potential extra spaces/newlines between <FINAL> and the score.
+#     pattern = r"<FINAL>\s*([\d\.]+)"
+#     match = re.search(pattern, text, re.MULTILINE)
+#     if match:
+#         try:
+#             score_str = match.group(1)
+#             return float(score_str)
+#         except ValueError:
+#             print(f"Warning: Could not convert '{score_str}' to float.")
+#             return None
+#     return None
+
+# def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
+#     print("--- Loading GSM8K Dataset ---")
+#     dataset = load_dataset("openai/gsm8k", "main", split="test")
+#     random.seed(42)
+#     indices = random.sample(range(len(dataset)), NUM_SAMPLES)
+    
+#     correct = 0
+#     for i, idx in enumerate(indices):
+#         sample = dataset[idx]
+#         question = sample["question"]
+#         truth_str = sample["answer"]
+        
+#         print(f"\n{'='*15} SAMPLE {i+1}/{NUM_SAMPLES} {'='*15}")
+#         print(f"Q: {question}")
+
+#         # Apply Chat Template with System Prompt
+#         messages = [
+#             {"role": "system", "content": SYSTEM_PROMPT},
+#             {"role": "user", "content": question}
+#         ]
+#         formatted_prompt = searcher.tokenizer.apply_chat_template(
+#             messages, tokenize=False, add_generation_prompt=True
+#         )
+
+#         if use_parallel:
+#             output = searcher.run_parallel(formatted_prompt)
+#         else:
+#             output = searcher.run(formatted_prompt)
+
+#         # Evaluation
+#         pred = extract_answer_number(output)
+#         truth = extract_answer_number(truth_str.split("####")[-1]) if "####" in truth_str else None
+        
+#         is_correct = (pred is not None and truth is not None and abs(pred - truth) < 1e-6)
+#         if is_correct: correct += 1
+#         print(f"\n[Generated]: {output.strip()}")
+#         print(f"\n[Truth]:     {sample['answer']}")
+#         print(f"\nPred: {pred} | Truth: {truth} | {'✅' if is_correct else '❌'}")
+
+#     print(f"\nAccuracy: {correct}/{NUM_SAMPLES} ({correct/NUM_SAMPLES*100:.1f}%)")
+
+# def test_gsm8k(searcher: HybridSearcher, use_parallel: bool = False):
+#     print("--- Loading GSM8K Dataset ---")
+#     dataset = load_dataset("openai/gsm8k", "main", split="test")
+
+#     indices = random.sample(range(len(dataset)), NUM_SAMPLES)
+#     samples = [dataset[i] for i in indices]
+
+#     for i, sample in enumerate(samples):
+#         question = sample["question"]
+#         ground_truth = sample["answer"]
+
+#         print(f"\n\n{'='*20} SAMPLE {i+1}/{NUM_SAMPLES} {'='*20}")
+#         print(f"QUESTION: {question}")
+
+#         formatted_prompt = f"Question: {question}\nAnswer:"
+
+#         if use_parallel:
+#             final_answer = searcher.run_parallel(formatted_prompt)
+#         else:
+#             final_answer = searcher.run(formatted_prompt)
+
+#         print(f"\n--- RESULT ---")
+#         print(f"GENERATED: {final_answer.strip()}")
+#         print(f"TRUTH:     {ground_truth}")
+
+def extract_result(text):
+    # Regex pattern explanation:
+    # r"..." : Raw string literal
+    # <FINAL>\s* : Matches the literal '<FINAL>' followed by zero or more whitespace characters
+    # ([\d\.]+) : Capturing Group 1. Matches one or more digits (\d) or decimal points (\.).
+    # $ : Asserts position at the end of the string (optional, but good for cleanup)
+    
+    # We use \s* to handle potential extra spaces/newlines between <FINAL> and the score.
+    pattern = r"<FINAL>\s*([\d\.]+)"
+    match = re.search(pattern, text, re.MULTILINE)
+    if match:
+        try:
+            score_str = match.group(1)
+            return float(score_str)
+        except ValueError:
+            print(f"Warning: Could not convert '{score_str}' to float.")
+            return None
+    return None
+
+
+def test_gsm8k(searcher, use_parallel: bool = True, VERBOSE: bool = True):
     dataset = load_dataset("openai/gsm8k", "main", split="test")
-
+    random.seed(SEED)
     indices = random.sample(range(len(dataset)), NUM_SAMPLES)
-    samples = [dataset[i] for i in indices]
-
-    for i, sample in enumerate(samples):
-        question = sample["question"]
-        ground_truth = sample["answer"]
-
-        print(f"\n\n{'='*20} SAMPLE {i+1}/{NUM_SAMPLES} {'='*20}")
-        print(f"QUESTION: {question}")
-
-        formatted_prompt = f"Question: {question}\nAnswer:"
-
+    correct = 0
+    for i in indices:
+        sample = dataset[i]
+        print(f"\n\n=== Question: {sample['question']} ===")
         if use_parallel:
-            final_answer = searcher.run_parallel(formatted_prompt)
+            output_text = searcher.run_parallel(sample['question'])
         else:
-            final_answer = searcher.run(formatted_prompt)
+            output_text = searcher.run(sample['question'])
+        answer = extract_result(output_text)
 
-        print(f"\n--- RESULT ---")
-        print(f"GENERATED: {final_answer.strip()}")
-        print(f"TRUTH:     {ground_truth}")
+        idx = sample['answer'].find("####")
+        if idx == -1:
+            print("Warning: Could not find '####' in ground truth answer.", sample['answer'])
+            continue
+        # if answer is None:
+        #     print("Warning: Could not extract answer from generated output.", output_text)
+        #     continue
+        truth_answer = float(sample['answer'][idx+4:].strip())
+        correct += abs(answer - truth_answer) < EPSILON
+        if VERBOSE:
+            print(f"\n[Generated]: {output_text.strip()}")
+            print(f"[Generated Answer]: {answer} | [Truth Answer]: {truth_answer}")
+        else:
+            print(f"[Generated Answer]: {answer} | [Truth Answer]: {truth_answer}")
+
+    print(f"\n\n=== GSM8K Results: {correct}/{NUM_SAMPLES} correct ===")
 
 
 if __name__ == "__main__":

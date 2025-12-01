@@ -17,14 +17,14 @@ bnb_config = BitsAndBytesConfig(
 )
 
 STOP_STRING = "<END_STEP>"
+FINAL_ANSWER_PREFIX = "<FINAL>"
 
-SYS_PROMPT = f"""
-You are a genius math solver. 
-Solve the problem step-by-step to avoid mistake. 
-After every logical step of reasoning, output the token {STOP_STRING}.
-DO NOT output multiple steps at once.
-Give the final answer, with ### prefix, only all steps are completed.
-"""
+SYS_PROMPT = f"""You are a genius problem solver. 
+Solve the problem step-by-step to avoid mistakes.
+After **EVERY logical step** of reasoning, output the token {STOP_STRING}.
+If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` prefix (for example: `{FINAL_ANSWER_PREFIX} 16` or `{FINAL_ANSWER_PREFIX} 90.6`)"""
+
+
 
 class BacktrackGenerator(AbstractGenerator):
     def __init__(self, model_name, device=DEVICE, quantization_config=bnb_config):
