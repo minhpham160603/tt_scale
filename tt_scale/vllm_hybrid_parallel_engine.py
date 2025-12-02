@@ -22,13 +22,13 @@ SEED = 69
 
 
 # Parallel hybrid search
-PAR_K_TOKENS = 100
-PAR_TAU = 0.6
+
 MAX_RETRIES = 3            
 M_EXPANSION = 3            
 MAX_TOTAL_BRANCHES = 6  
 KEEPING_BRANCHES = 2
-MAX_STEPS = 10        
+# MAX_STEPS = 100    
+MAX_FINISHED_BRANCHES = 3    
 EPSILON = 1e-3     
 # ==========================================
 # 1. VLLM Generator Wrapper
@@ -114,6 +114,28 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         
         return result
 
+    def generate_batch_step(self, full_contexts, retry_attempt=0, M_EXPANSION=1):
+        temp = 1 + (0.5 * retry_attempt)
+        params = SamplingParams(
+            temperature=temp,
+            max_tokens=K_TOKENS,
+            top_p=0.9,
+            top_k=40,
+            n=M_EXPANSION,
+            stop=[self.stop_token],
+        )
+        outputs = self.llm.generate(full_contexts, params, use_tqdm=False)
+        
+        batch_result = []
+        for o in outputs:
+            seqs = []
+            for out in o.outputs:
+                new_text = out.text
+                is_eos = (out.finish_reason == "stop" and self.stop_token not in new_text)
+                seqs.append((new_text, is_eos))
+            batch_result.append(seqs)
+        return batch_result
+
 # ==========================================
 # 2. VLLM PRM Wrapper
 # ==========================================
@@ -181,7 +203,8 @@ class HybridSearcher:
                 break
 
             # 2. Generate Step
-            new_chunk, is_eos = self.gen.generate_step(full_gen_context, retry_attempt=bt_count)
+            outputs = self.gen.generate_step(full_gen_context, retry_attempt=bt_count)
+            new_chunk, is_eos = outputs[0]  
             
             if not new_chunk:
                 if is_eos: finished = True
@@ -223,16 +246,18 @@ class HybridSearcher:
 
 
         finished_branches = []
+        protected_branches = [] # protect passed branches when backtracking
         step_count = 0
         retries = 0
         jumping = False
+        finished = False
 
-        while active_branches:
+        while active_branches and not finished:
             
             step_count += 1
-            if step_count > MAX_STEPS:
-                print("Max steps reached.")
-                break
+            # if step_count > MAX_STEPS:
+            #     print("Max steps reached.")
+            #     break
             # cloned_branches = []
             # clone_times = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
             # for branch in active_branches:
@@ -253,39 +278,65 @@ class HybridSearcher:
                 passing_threshold = 0.0
                 jumping = False
             else:
-                passing_threshold = PAR_TAU
+                passing_threshold = TAU
 
+            contexts = []
+            branch_indices = []
             m_expansion = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
-            for i,branch in enumerate(active_branches):
-                try:
-                    if branch["finished"]:
-                        continue
-                    # Calls the updated generate_batch_step with fixed mask dtype
-                    current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
-                    full_gen_context = self.gen.build_input_context(prompt, current_generated)
-                    
-                    outputs = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=m_expansion)
-                    
-                    # new_chunk, is_eos = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=M_EXPANSION)
-                    
-                    # if not new_chunk:
-                    #     if is_eos: 
-                    #         branch[finished] = True
-                    #     checkpoints.pop()
-                    #     continue
-                    # print(f"  -> Generated {len(generated_seqs)} sequences.")
-                except RuntimeError as e:
-                    if "CUDA out of memory" in str(e):
-                        print("OOM Error! Clearing cache and reducing branches.")
-                        torch.cuda.empty_cache()
-                        active_branches = active_branches[:1] # Drastic fallback
-                        continue
-                    raise e
+            extra = MAX_TOTAL_BRANCHES - (m_expansion * len(active_branches))
+            for i, branch in enumerate(active_branches):
+                if branch["finished"]:
+                    continue
+                current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
+                ctx = self.gen.build_input_context(prompt, current_generated)
+                contexts.append(ctx)
+                branch_indices.append(i)
+            
+            batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion)
 
-                for j, (new_chunk, is_eos) in enumerate(outputs):
+            for bi, seqs in zip(branch_indices, batch_outputs):
+                branch = active_branches[bi]
+                current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
+                for j, (new_chunk, is_eos) in enumerate(seqs):
                     full_answer_candidate = current_generated + new_chunk
                     score = self.prm.get_score(prompt, full_answer_candidate)
-                    branch["average_score"]  += score
+                    branch["average_score"] += score
+
+    
+            # m_expansion = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
+            # for i,branch in enumerate(active_branches):
+            #     try:
+            #         if branch["finished"]:
+            #             continue
+            #         # Calls the updated generate_batch_step with fixed mask dtype
+            #         current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
+            #         full_gen_context = self.gen.build_input_context(prompt, current_generated)
+                    
+            #         if i == 0:
+            #             # add extra for first branch (highed score) to utilize full capacity
+            #             m_expansion += MAX_TOTAL_BRANCHES - (m_expansion * len(active_branches))
+            #         outputs = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=m_expansion)
+                    
+            #         # new_chunk, is_eos = self.gen.generate_step(full_gen_context, retry_attempt=retries, M_EXPANSION=M_EXPANSION)
+                    
+            #         # if not new_chunk:
+            #         #     if is_eos: 
+            #         #         branch[finished] = True
+            #         #     checkpoints.pop()
+            #         #     continue
+            #         # print(f"  -> Generated {len(generated_seqs)} sequences.")
+            #     except RuntimeError as e:
+            #         if "CUDA out of memory" in str(e):
+            #             print("OOM Error! Clearing cache and reducing branches.")
+            #             torch.cuda.empty_cache()
+            #             active_branches = active_branches[:1] # Drastic fallback
+            #             continue
+            #         raise e
+
+            #     for j, (new_chunk, is_eos) in enumerate(outputs):
+            #         full_answer_candidate = current_generated + new_chunk
+            #         score = self.prm.get_score(prompt, full_answer_candidate)
+            #         branch["average_score"]  += score
 
                     if score > passing_threshold:
                         print(f"  Br {i},{j}: ✅ Pass ({score:.2f})")
@@ -297,6 +348,10 @@ class HybridSearcher:
                                 "score": branch["score"],
                                 "finished": True
                             })
+
+                            if len(finished_branches) >= MAX_FINISHED_BRANCHES:
+                                print("  -> Reached max finished branches, stopping.")
+                                finished = True
                         else:
                             passing_branches.append({
                                 "score": score,
@@ -312,16 +367,21 @@ class HybridSearcher:
             # if enough passing branches, not backtracking, and prune to KEEPING_BRANCHES
             if passing >= KEEPING_BRANCHES:
                 print(f"  -> Sufficient passing branches ({passing}), pruning to {KEEPING_BRANCHES}.")
+                passing_branches.extend(protected_branches)
                 passing_branches.sort(key=lambda x: x["score"], reverse=True)
                 active_branches = passing_branches[:KEEPING_BRANCHES]
                 retries = 0  
+                protected_branches = []
 
 
             else:
                 print(f"  -> Insufficient passing branches ({passing}), backtracking.")
+                retries += 1
                 active_branches.sort(key=lambda x: x["average_score"], reverse=True)
-                # keep only top half for backtracking
-                backtrack_candidates = active_branches[:math.ceil(MAX_TOTAL_BRANCHES/2)]
+                protected_branches.extend(passing_branches)
+                # Eliminate low-score branches
+                baacktrack_num = MAX_TOTAL_BRANCHES - retries/(MAX_RETRIES+1) * (MAX_TOTAL_BRANCHES)
+                backtrack_candidates = active_branches[:int(baacktrack_num)]
                 
                 active_branches = []
                 for b in backtrack_candidates:
@@ -331,7 +391,6 @@ class HybridSearcher:
                         "finished": b["finished"],
                         "average_score": 0.0,
                     })
-                retries += 1
                 if retries > MAX_RETRIES:
                     print("  -> Max retries reached, forcing jumping")
                     jumping = True
@@ -368,15 +427,29 @@ def extract_result(text):
     # $ : Asserts position at the end of the string (optional, but good for cleanup)
     
     # We use \s* to handle potential extra spaces/newlines between <FINAL> and the score.
-    pattern = r"<FINAL>\s*([\d\.]+)"
-    match = re.search(pattern, text, re.MULTILINE)
-    if match:
+    # pattern = r"<FINAL>\s*([\d\.]+)"
+    pattern1 = r"(?i)(?:<FINAL>|Final\s*answer\s*:)[\s\S]*?([-+]?\d*\.?\d+)"
+    m1 = re.search(pattern1, text)
+    if m1:
         try:
-            score_str = match.group(1)
-            return float(score_str)
+            return float(m1.group(1))
         except ValueError:
-            print(f"Warning: Could not convert '{score_str}' to float.")
-            return None
+            pass
+
+    boxed_nums = re.findall(r"\\boxed\{\s*([-+]?\d*\.?\d+)\s*\}", text)
+    if boxed_nums:
+        try:
+            return float(boxed_nums[-1])  # 取最后一个 boxed 数字
+        except ValueError:
+            pass
+
+    nums = re.findall(r"([-+]?\d*\.?\d+)", text)
+    if nums:
+        try:
+            return float(nums[-1])
+        except ValueError:
+            pass
+
     return None
 
 
@@ -397,7 +470,9 @@ def test_gsm8k(searcher):
             continue
         if answer is None:
             print("No answer extracted.")
-            continue
+            print("Generated Text:", output_text)
+            # continue
+            break
         truth_answer = float(sample['answer'][idx+4:].strip())
         correct += abs(answer - truth_answer) < EPSILON
         if VERBOSE:
