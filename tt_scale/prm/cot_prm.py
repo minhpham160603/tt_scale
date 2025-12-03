@@ -37,8 +37,8 @@ class CoTPRM:
                 tensor_parallel_size=1, 
                 trust_remote_code=True,
                 dtype="float16",
-                max_model_len=8192,
-                # quantization="awq" # Uncomment if loading an AWQ model
+                max_model_len=1592,
+                quantization="awq" # Uncomment if loading an AWQ model
             )
             self.sampling_params = SamplingParams(
                 temperature=0.0,    # Greedy for deterministic reasoning
