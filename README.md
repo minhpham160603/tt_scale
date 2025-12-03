@@ -12,4 +12,4 @@ python -m tt_scale.hybrid_search
 ```
 
 
-![alt text](572a961b16edc660aaa0cd47f7fa17c6.jpg)
+
