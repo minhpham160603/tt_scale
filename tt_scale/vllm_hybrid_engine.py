@@ -5,14 +5,21 @@ from typing import Optional, List, Tuple
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
-# Ensure these imports exist in your project structure
-from tt_scale.prm.logits_prm import LogitsPRM
-from tt_scale.prm.vllm_cot_prm import VLLMCoTPRM
+# Import Unified Configuration
+from .config import (
+    MODEL_NAME,
+    LOGITS_PRM_MODEL,
+    UNIFIED_SYS_PROMPT,
+    PRM_SYS_PROMPT,
+    STOP_STRING,
+    FINAL_ANSWER_PREFIX,
+    extract_math_answer
+)
+
+    from tt_scale.prm.logits_prm import LogitsPRM
+    from tt_scale.prm.vllm_cot_prm import VLLMCoTPRM
 
 # --- Configuration ---
-MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
-LOGITS_PRM_MODEL = "RLHFlow/Llama3.1-8B-PRM-Deepseek-Data"
-
 K_TOKENS = 256
 TAU = 0.7                # Score threshold to keep a step
 MAX_BACKTRACKS = 3       # Max retries per step before backtracking
@@ -20,26 +27,19 @@ MAX_STEPS = 5            # Max depth of reasoning
 NUM_SAMPLES = 50
 SEED = 69
 EPSILON = 1e-3
-
-FINAL_ANSWER_PREFIX = "<FINAL>"
-STOP_STRING = "<END_STEP>"
 VERBOSE = True
 
 class VLLMGenerator:
     """Wraps vLLM engine to handle step-by-step generation with specific stop tokens."""
-
-    SYS_PROMPT = f"""You are a genius problem solver.
-Solve the problem step-by-step to avoid mistakes.
-After **EVERY logical step** of reasoning, output the token {STOP_STRING}.
-If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` prefix (e.g., `{FINAL_ANSWER_PREFIX} 16`)."""
 
     def __init__(self, llm_engine):
         self.llm = llm_engine
         self.tokenizer = self.llm.get_tokenizer()
 
     def build_input_context(self, question: str, partial_answer: str = "") -> str:
+        # Uses the UNIFIED_SYS_PROMPT (Helpful math solver + \boxed{})
         messages = [
-            {"role": "system", "content": self.SYS_PROMPT},
+            {"role": "system", "content": UNIFIED_SYS_PROMPT},
             {"role": "user", "content": question},
         ]
         context = self.tokenizer.apply_chat_template(
@@ -48,8 +48,10 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         return context + partial_answer
 
     def generate_step(self, full_context: str, retry_attempt: int = 0) -> Tuple[str, bool]:
-        # Adaptive temperature: slightly increase creativity on retries
-        temp = min(0.0 + (0.2 * retry_attempt), 1.2)
+        # Adaptive temperature:
+        # Start at 0.5 to ensure some diversity on the first try (for scoring potential).
+        # Increase slightly on retries to find new paths, but cap at 0.9 to prevent hallucination.
+        temp = min(0.5 + (0.1 * retry_attempt), 0.9)
 
         params = SamplingParams(
             temperature=temp,
@@ -67,10 +69,14 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
 
         return new_text, is_eos
 
-class VLLMCoTPRMWrapper(VLLMCoTPRM):
+class VLLMCoTPRMWrapper:
     """Extension of base VLLMCoTPRM with specific prompting logic."""
+    def __init__(self, llm_engine):
+        self.llm = llm_engine
+        self.tokenizer = self.llm.get_tokenizer()
 
     def get_score(self, question: str, partial_answer: str) -> float:
+        # Uses the PRM_SYS_PROMPT (Strict grader)
         judge_prompt = f"""
 Review the following partial solution to a math problem.
 ---
@@ -81,7 +87,7 @@ Rate the logical correctness of the MOST RECENT STEP in the Partial Answer on a 
 Output ONLY the number.
 """
         messages = [
-            {"role": "system", "content": "You are a strict math grader. Output only numerical scores."},
+            {"role": "system", "content": PRM_SYS_PROMPT},
             {"role": "user", "content": judge_prompt}
         ]
         full_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -123,7 +129,8 @@ class HybridSearcher:
                 final_response = current_generated
                 break
 
-            if FINAL_ANSWER_PREFIX in current_generated:
+            # Check for \boxed{} as per Unified Prompt instructions
+            if "\\boxed{" in current_generated:
                 final_response = current_generated
                 break
 
@@ -152,7 +159,7 @@ class HybridSearcher:
                 checkpoints.append((full_candidate, 0))
                 step_count += 1
 
-                if FINAL_ANSWER_PREFIX in new_chunk:
+                if "\\boxed{" in new_chunk:
                     final_response = full_candidate
                     break
 
@@ -193,35 +200,10 @@ class HybridSearcher:
 # Evaluation & Main
 # ==========================================
 
-def extract_math_answer(text: str) -> Optional[float]:
-    """Robust extraction of numerical answers."""
-    # Priority 1: Boxed LaTeX
-    boxed = re.search(r"\\boxed{([^}]+)}", text)
-    if boxed:
-        clean = boxed.group(1).replace('$', '').replace('\\', '').replace(',', '').strip()
-        try:
-            nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", clean)
-            if nums: return float(nums[-1])
-        except: pass
-
-    # Priority 2: <FINAL> Tag
-    tag = re.search(rf"{FINAL_ANSWER_PREFIX}\s*([^ \n]+)", text)
-    if tag:
-        try: return float(tag.group(1).replace(',', '').strip())
-        except: pass
-
-    # Priority 3: Last number fallback
-    try:
-        all_nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text.replace(',', ''))
-        if all_nums: return float(all_nums[-1])
-    except: pass
-    return None
-
 def main():
     print(f"Initializing Generator: {MODEL_NAME}")
 
     # Initialize Generator (vLLM)
-    # Note: gpu_memory_utilization adjusted to allow space for PRM if needed
     engine = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
@@ -229,6 +211,7 @@ def main():
         trust_remote_code=True,
         dtype="float16",
         max_model_len=4096,
+        enforce_eager=True
     )
     generator = VLLMGenerator(engine)
 
@@ -245,7 +228,7 @@ def main():
     # prm = LogitsPRM(
     #     model_name=LOGITS_PRM_MODEL,
     #     device="cuda",
-    #     quantization_config=None # Add config if needed for 4bit
+    #     quantization_config=None
     # )
 
     if prm is None:

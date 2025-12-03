@@ -1,5 +1,5 @@
-transformers
-torch
 bitsandbytes
 accelerate
+transformers
 vllm
+datasets

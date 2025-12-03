@@ -1,0 +1,45 @@
+# Environment Definition File for TT-Scale (GH200)
+image = "/iopsstor/scratch/cscs/mneuwinger/tt-scale-vllm-0.11.0.sqsh"
+
+# Mount necessary filesystems
+mounts = [
+    "/capstor",
+    "/iopsstor",
+    "/users"
+]
+
+# Allow writing to create venv and compile extensions
+writable = true
+
+[annotations]
+# AWS OFI NCCL plugin for Slingshot interconnect
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
+
+[env]
+# NCCL Configuration
+NCCL_DEBUG = "INFO"
+NCCL_NET = "AWS Libfabric"
+NCCL_NET_GDR_LEVEL = "PHB"
+NCCL_CROSS_NIC = "1"
+# ^LL128 protocol can sometimes cause issues on GH200 with specific torch versions,
+# but keeping it based on your previous success.
+NCCL_PROTO = "^LL128"
+
+# PyTorch & Triton Configuration
+TORCH_NCCL_ASYNC_ERROR_HANDLING = "1"
+# Triton cache in memory is faster for vLLM
+TRITON_HOME = "/dev/shm/"
+
+# CUDA Configuration
+CUDA_CACHE_DISABLE = "1"
+
+# MPICH Configuration (Disable GPU support in MPICH to let NCCL handle it)
+MPICH_GPU_SUPPORT_ENABLED = "0"
+
+# Libfabric Configuration (Slingshot Optimizations)
+FI_CXI_DEFAULT_CQ_SIZE = "131072"
+FI_CXI_DEFAULT_TX_SIZE = "16384"
+FI_CXI_DISABLE_HOST_REGISTER = "1"
+FI_CXI_RX_MATCH_MODE = "software"
+FI_MR_CACHE_MONITOR = "userfaultfd"

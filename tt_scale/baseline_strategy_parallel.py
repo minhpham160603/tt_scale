@@ -1,100 +1,147 @@
-import re
-from vllm import LLM, SamplingParams
+import time
+from tqdm import tqdm
 from datasets import load_dataset
-from typing import Optional
+from vllm import LLM, SamplingParams
 
-# --- Configuration (UPDATED MODEL) ---
-MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
-NUM_SAMPLES = 100
-MAX_TOKENS = 2048
+# Import Utils and Config
+try:
+    from .config import MODEL_NAME, UNIFIED_SYS_PROMPT, extract_math_answer
+    from .experiment_utils import save_experiment_results, calculate_metrics
+except ImportError:
+    from config import MODEL_NAME, UNIFIED_SYS_PROMPT, extract_math_answer
+    from experiment_utils import save_experiment_results, calculate_metrics
 
-def extract_math_answer(text: str) -> Optional[float]:
-    """
-    Robust extraction for MATH dataset answers (\boxed{...}) or simple numbers.
-    """
-    # 1. Prefer Boxed LaTeX
-    boxed_match = re.search(r"\\boxed{([^}]+)}", text)
-    if boxed_match:
-        content = boxed_match.group(1).strip()
-        content = content.replace('$', '').replace('\\', '').replace(',', '')
-        try:
-            # Try finding the last number in the box
-            nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", content)
-            if nums: return float(nums[-1])
-        except: pass
+# ==========================================
+# CONFIGURATION
+# ==========================================
+EXPERIMENT_NAME = "baseline_greedy_parallel"
 
-    # 2. Fallback: Look for the last number in the text
-    try:
-        nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text.replace(',', ''))
-        if nums: return float(nums[-1])
-    except: pass
-    return None
+# Realistic settings for a solid benchmark run
+NUM_SAMPLES = 500        # Full MATH-500 set is standard
+MAX_TOKENS = 2048        # Sufficient for CoT reasoning
+TEMPERATURE = 0.0        # Greedy = 0.0 for Baseline
+GPU_MEMORY_UTIL = 0.90   # High utilization for max parallel batching
 
 def main():
-    # 1. Load Data
-    print(f"Loading MATH-500 (First {NUM_SAMPLES} samples)...")
-    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
-    dataset = dataset.select(range(NUM_SAMPLES))
+    # 1. Setup Configuration Object
+    config = {
+        "model_name": MODEL_NAME,
+        "num_samples": NUM_SAMPLES,
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "gpu_memory_utilization": GPU_MEMORY_UTIL,
+        "strategy": "vllm_continuous_batching"
+    }
 
-    # 2. Initialize Model
-    print(f"Loading {MODEL_NAME}...")
+    # 2. Load Data
+    print(f"--- Starting {EXPERIMENT_NAME} (N={NUM_SAMPLES}) ---")
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+
+    # Select specific range (e.g., first N samples)
+    # Using the full requested size, or the dataset max if smaller
+    limit = min(len(dataset), NUM_SAMPLES)
+    dataset = dataset.select(range(limit))
+
+    # 3. Initialize Model (vLLM Parallel Engine)
+    print(f"Initializing vLLM Engine [{MODEL_NAME}]...")
+    print(f" -> GPU Memory Util: {GPU_MEMORY_UTIL}")
+
     llm = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.95, # Aggressively use GPU for large batch
+        gpu_memory_utilization=GPU_MEMORY_UTIL,
         trust_remote_code=True,
         dtype="float16",
-        max_model_len=4096
+        max_model_len=4096,
+        enforce_eager=False # False = Enable CUDA graph optimizations (Faster)
     )
     tokenizer = llm.get_tokenizer()
 
-    # 3. Prepare Prompts
+    # 4. Prepare Prompts (Batch Pre-processing)
+    print("Formatting prompts...")
     prompts = []
-    problems = []
+    raw_problems = []
     ground_truths = []
 
     for sample in dataset:
-        problem = sample.get('problem', sample.get('question'))
-        ground_truth = sample.get('solution', sample.get('answer'))
+        p = sample.get('problem', sample.get('question'))
+        t = sample.get('solution', sample.get('answer'))
 
-        problems.append(problem)
-        ground_truths.append(ground_truth)
+        raw_problems.append(p)
+        ground_truths.append(t)
 
-        # Apply Qwen's recommended math prompt template
         messages = [
-            {"role": "system", "content": "You are a helpful math solver. Solve the problem step-by-step. Put your final answer within \\boxed{}."},
-            {"role": "user", "content": problem}
+            {"role": "system", "content": UNIFIED_SYS_PROMPT},
+            {"role": "user", "content": p}
         ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompts.append(text)
+        full_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompts.append(full_text)
 
-    # 4. Generate (Standard Greedy Decoding in one large batch)
-    print(f"Generating {len(prompts)} responses in a single batch...")
-    # CRITICAL: temperature=0.0 ensures simple, deterministic greedy decoding
-    params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, n=1)
+    # 5. Parallel Generation (The "Realistic" Batch)
+    print(f"Parallel Generation of {len(prompts)} requests...")
+
+    params = SamplingParams(
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        n=1 # One output per prompt (Greedy)
+    )
+
+    start_time = time.time()
+
+    # This single line executes the whole batch in parallel on the GPU
     outputs = llm.generate(prompts, params, use_tqdm=True)
 
-    # 5. Evaluate
-    correct = 0
-    print("\n--- Evaluation ---")
+    duration = time.time() - start_time
+    print(f"Generation finished in {duration:.2f}s ({(len(prompts)/duration):.1f} req/s)")
+
+    # 6. Scoring & Processing
+    results = []
+    print("Scoring responses...")
 
     for i, output in enumerate(outputs):
-        gen_text = output.outputs[0].text
+        generated_text = output.outputs[0].text
 
-        gen_ans = extract_math_answer(gen_text)
-        truth_ans = extract_math_answer(ground_truths[i])
+        # Parse
+        pred_val = extract_math_answer(generated_text)
+        truth_val = extract_math_answer(ground_truths[i])
 
+        # Verify
         is_correct = False
-        if gen_ans is not None and truth_ans is not None:
-            # Standard tolerance check for math
-            is_correct = abs(gen_ans - truth_ans) < 1e-3
-            if is_correct: correct += 1
+        if pred_val is not None and truth_val is not None:
+            is_correct = abs(pred_val - truth_val) < 1e-3
 
-        status = "✅" if is_correct else "❌"
-        print(f"Sample {i+1}: {status} | Truth: {truth_ans} | Pred: {gen_ans}")
+        # Store Result
+        sample_result = {
+            "id": i,
+            "problem": raw_problems[i],
+            "prediction_full": generated_text,
+            "prediction_extracted": pred_val,
+            "truth_full": ground_truths[i],
+            "truth_extracted": truth_val,
+            "is_correct": is_correct
+        }
+        results.append(sample_result)
 
-    accuracy = correct / NUM_SAMPLES
-    print(f"\n=== Greedy Baseline (T=0) Accuracy: {accuracy:.2%} ({correct}/{NUM_SAMPLES}) ===")
+    # 7. Metrics & Save
+    metrics = calculate_metrics(results, duration)
+
+    save_path = save_experiment_results(
+        experiment_name=EXPERIMENT_NAME,
+        config=config,
+        results=results,
+        metrics=metrics
+    )
+
+    # 8. Clean Summary
+    print(f"\n{'='*40}")
+    print(f"BASELINE PARALLEL SUMMARY")
+    print(f"{'='*40}")
+    print(f"Accuracy : {metrics['accuracy']:.2%} ({metrics['correct_count']}/{metrics['total_samples']})")
+    print(f"TPS      : {(metrics['total_samples'] * MAX_TOKENS / duration):.0f} (Approx tokens/sec)")
+    print(f"Saved to : {save_path}")
+    print(f"{'='*40}")
 
 if __name__ == "__main__":
     main()

@@ -1,64 +1,55 @@
-import re
+import time
 import numpy as np
-import torch
-from vllm import LLM, SamplingParams
+import re
+from typing import List, Dict, Any
+from tqdm import tqdm
 from datasets import load_dataset
-from typing import List, Optional, Tuple
-from tt_scale.prm.logits_prm import LogitsPRM
+from vllm import LLM, SamplingParams
+
+# Import Utils and Config
+try:
+    from .config import (
+        MODEL_NAME,
+        LOGITS_PRM_MODEL,
+        UNIFIED_SYS_PROMPT,
+        PRM_SYS_PROMPT,
+        extract_math_answer
+    )
+    from .experiment_utils import save_experiment_results, calculate_metrics
+except ImportError:
+    from config import (
+        MODEL_NAME,
+        LOGITS_PRM_MODEL,
+        UNIFIED_SYS_PROMPT,
+        PRM_SYS_PROMPT,
+        extract_math_answer
+    )
+    from experiment_utils import save_experiment_results, calculate_metrics
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-
-MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
-LOGITS_PRM_MODEL = "RLHFlow/Llama3.1-8B-PRM-Deepseek-Data"
-
-NUM_SAMPLES = 100
+EXPERIMENT_NAME = "best_of_n_parallel"
+NUM_SAMPLES = 500         # Full MATH-500
 MAX_TOKENS = 2048
+N = 4                     # Number of candidates per problem
+TEMPERATURE_GEN = 0.5     # Diversity for candidates
 
-# Best of N Settings
-N = 4
-TEMPERATURE_GEN = 0.8
-
-# --- PRM SELECTION (Uncomment one) ---
-
-# [OPTION A] Self-Correction: Use the Generator itself to score via prompting
+# --- PRM MODE SELECTION ---
+# "self_correction": Generator scores itself (1 Model, High VRAM usage)
+# "logits": External PRM scores (2 Models, Split VRAM usage)
 PRM_MODE = "self_correction"
-# GPU_MEMORY_UTIL = 0.95  # Use almost all VRAM for the single model
 
-# [OPTION B] Logits PRM: Use a separate finetuned PRM (Loads a 2nd model!)
-# PRM_MODE = "logits"
-# GPU_MEMORY_UTIL = 0.6   # Reduce Generator VRAM to make room for PRM
-
-# Automatically set memory utilization based on mode if not manually set above
-if 'GPU_MEMORY_UTIL' not in locals():
-    GPU_MEMORY_UTIL = 0.95 if PRM_MODE == "self_correction" else 0.6
+# Dynamic Memory Allocation
+# If "logits", we reserve 40% VRAM for the HF Verifier, leaving 60% for vLLM
+GPU_MEMORY_UTIL = 0.95 if PRM_MODE == "self_correction" else 0.6
 
 # ==========================================
-# Helper Functions
+# Helpers
 # ==========================================
-
-def extract_math_answer(text: str) -> Optional[float]:
-    """Robust extraction for MATH dataset answers (\boxed{...}) or simple numbers."""
-    # 1. Prefer Boxed LaTeX
-    boxed_match = re.search(r"\\boxed{([^}]+)}", text)
-    if boxed_match:
-        content = boxed_match.group(1).strip()
-        content = content.replace('$', '').replace('\\', '').replace(',', '')
-        try:
-            nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", content)
-            if nums: return float(nums[-1])
-        except: pass
-
-    # 2. Fallback: Look for the last number in the text
-    try:
-        nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text.replace(',', ''))
-        if nums: return float(nums[-1])
-    except: pass
-    return None
 
 def extract_score_text(text: str) -> float:
-    """Extracts a score (0-10) from the judge's text response (Option A)."""
+    """Extracts a score (0-10) from the judge's text response."""
     match = re.search(r"(?:Score:\s*)?(\d+(\.\d+)?)", text)
     if match:
         try:
@@ -68,12 +59,10 @@ def extract_score_text(text: str) -> float:
     return 0.0
 
 def create_judge_prompt(tokenizer, problem, candidate_answer):
-    """Creates the prompt for Self-Correction (Option A)."""
-    sys_prompt = "You are a strict math grader. Review the problem and the proposed answer. Assign a score from 1 to 10 based on correctness. Output ONLY the score, e.g., 'Score: 8'."
+    """Formats the self-correction prompt."""
     user_content = f"Problem: {problem}\n\nProposed Answer:\n{candidate_answer}\n\nPlease rate the correctness of the answer above from 1 to 10."
-
     messages = [
-        {"role": "system", "content": sys_prompt},
+        {"role": "system", "content": PRM_SYS_PROMPT},
         {"role": "user", "content": user_content}
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -83,18 +72,30 @@ def create_judge_prompt(tokenizer, problem, candidate_answer):
 # ==========================================
 
 def main():
-    print(f"--- Configuration: Mode=[{PRM_MODE}] | GPU Util=[{GPU_MEMORY_UTIL}] ---")
+    # 1. Configuration Object
+    config = {
+        "experiment_name": EXPERIMENT_NAME,
+        "model_name": MODEL_NAME,
+        "prm_mode": PRM_MODE,
+        "prm_model": LOGITS_PRM_MODEL if PRM_MODE == "logits" else MODEL_NAME,
+        "n_candidates": N,
+        "num_samples": NUM_SAMPLES,
+        "temperature_gen": TEMPERATURE_GEN,
+        "gpu_utilization": GPU_MEMORY_UTIL
+    }
 
-    # 1. Load Data
-    print(f"Loading MATH-500 (First {NUM_SAMPLES} samples)...")
+    print(f"--- Starting {EXPERIMENT_NAME} (N={NUM_SAMPLES}, Best-of-{N}) ---")
+    print(f"--- Mode: {PRM_MODE} | GPU Util: {GPU_MEMORY_UTIL} ---")
+
+    # 2. Load Data
     dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
-    dataset = dataset.select(range(NUM_SAMPLES))
+    dataset = dataset.select(range(min(len(dataset), NUM_SAMPLES)))
+
     problems = [sample.get('problem', sample.get('question')) for sample in dataset]
     ground_truths = [sample.get('solution', sample.get('answer')) for sample in dataset]
-    truth_vals = [extract_math_answer(t) for t in ground_truths]
 
-    # 2. Initialize Generator (vLLM)
-    print(f"Loading Generator {MODEL_NAME}...")
+    # 3. Initialize Generator (vLLM)
+    print(f"Loading Generator: {MODEL_NAME}")
     llm = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
@@ -102,49 +103,61 @@ def main():
         trust_remote_code=True,
         dtype="float16",
         max_model_len=4096,
+        enforce_eager=False
     )
     tokenizer = llm.get_tokenizer()
 
-    # 3. Initialize PRM (If Option B)
+    # 4. Initialize PRM (If External)
     prm_engine = None
     if PRM_MODE == "logits":
-        print(f"Loading Logits PRM {LOGITS_PRM_MODEL}...")
-        # Note: LogitsPRM uses standard HF, so it will allocate remaining VRAM
-        prm_engine = LogitsPRM(model_name=LOGITS_PRM_MODEL, device="cuda")
+        print(f"Loading External PRM: {LOGITS_PRM_MODEL}")
+        try:
+            from tt_scale.prm.logits_prm import LogitsPRM
+            prm_engine = LogitsPRM(model_name=LOGITS_PRM_MODEL, device="cuda")
+        except ImportError:
+            print("❌ Error: Could not import LogitsPRM.")
+            return
 
-    # 4. Phase 1: Generate N Candidates (Batch)
-    print(f"\n--- Phase 1: Generating {len(problems) * N} candidates ---")
+    # ==========================================
+    # PHASE 1: Parallel Generation
+    # ==========================================
+    print(f"\n[Phase 1] Generating {len(problems) * N} candidates...")
+
+    formatted_prompts = []
+    for p in problems:
+        msgs = [{"role": "system", "content": UNIFIED_SYS_PROMPT}, {"role": "user", "content": p}]
+        formatted_prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+
     gen_params = SamplingParams(
         temperature=TEMPERATURE_GEN,
         max_tokens=MAX_TOKENS,
-        n=N, # Generate N sequences per prompt
+        n=N, # vLLM generates N sequences per prompt efficiently
         top_p=0.9,
     )
 
-    # Pre-format prompts for Qwen
-    formatted_prompts = []
-    for p in problems:
-        msgs = [{"role": "system", "content": "You are a helpful math solver. Solve step-by-step. Put final answer in \\boxed{}."},
-                {"role": "user", "content": p}]
-        formatted_prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
-
+    t0 = time.time()
     gen_outputs = llm.generate(formatted_prompts, gen_params, use_tqdm=True)
+    time_gen = time.time() - t0
 
-    # Organize candidates: List of Lists [[cand1, cand2...], [cand1, cand2...]]
-    all_candidates: List[List[str]] = []
+    # Organize: [[C1..CN], [C1..CN]]
+    all_candidates_text = []
     for output in gen_outputs:
-        all_candidates.append([o.text for o in output.outputs])
+        all_candidates_text.append([o.text for o in output.outputs])
 
-    # 5. Phase 2: Score Candidates (Batch)
-    print(f"\n--- Phase 2: Scoring Candidates (Mode: {PRM_MODE}) ---")
+    # ==========================================
+    # PHASE 2: Batch Scoring
+    # ==========================================
+    print(f"\n[Phase 2] Scoring Candidates (Mode: {PRM_MODE})...")
 
-    # Flatten for processing
-    flat_candidates = [cand for sublist in all_candidates for cand in sublist]
+    # Flatten for batch processing: [P1_C1, P1_C2 ... P2_C1, P2_C2...]
+    flat_candidates = [c for sublist in all_candidates_text for c in sublist]
     flat_problems = [p for p in problems for _ in range(N)]
     flat_scores = []
 
+    t1 = time.time()
+
     if PRM_MODE == "self_correction":
-        # Option A: Use vLLM to generate scores
+        # Option A: Generator grades itself via vLLM
         judge_prompts = [
             create_judge_prompt(tokenizer, flat_problems[i], flat_candidates[i])
             for i in range(len(flat_candidates))
@@ -154,40 +167,88 @@ def main():
         flat_scores = [extract_score_text(out.outputs[0].text) for out in score_outputs]
 
     elif PRM_MODE == "logits":
-        # Option B: Use external LogitsPRM
-        # Prepare pairs for the PRM batch function
+        # Option B: External HF PRM scores the batch
+        # Note: LogitsPRM usually runs on HF, so it might be slower than vLLM
         qa_pairs = list(zip(flat_problems, flat_candidates))
-        # LogitsPRM.get_scores_batch handles the HF inference
         flat_scores = prm_engine.get_scores_batch(qa_pairs)
 
-    # 6. Phase 3: Select Best & Evaluate
-    print(f"\n--- Phase 3: Selection & Evaluation ---")
-    correct_count = 0
+    time_score = time.time() - t1
+
+    # ==========================================
+    # PHASE 3: Selection & Evaluation
+    # ==========================================
+    print(f"\n[Phase 3] Selecting & Aggregating Results...")
+
+    results = []
 
     for i in range(len(problems)):
-        # Slice the flattened scores for this problem
+        # Reconstruct structure for this problem
         start_idx = i * N
-        problem_scores = flat_scores[start_idx : start_idx + N]
-        problem_candidates = all_candidates[i]
+        p_scores = flat_scores[start_idx : start_idx + N]
+        p_cands = all_candidates_text[i]
 
-        # Argmax
-        best_idx = np.argmax(problem_scores)
-        best_candidate = problem_candidates[best_idx]
-        best_score = problem_scores[best_idx]
+        # 1. Select Best
+        best_idx = np.argmax(p_scores)
+        best_cand_text = p_cands[best_idx]
+        best_score = p_scores[best_idx]
 
-        # Check Truth
-        pred_val = extract_math_answer(best_candidate)
+        # 2. Evaluate
+        truth_val = extract_math_answer(ground_truths[i])
+        pred_val = extract_math_answer(best_cand_text)
+
         is_correct = False
-        if pred_val is not None and truth_vals[i] is not None:
-            is_correct = abs(pred_val - truth_vals[i]) < 1e-3
+        if pred_val is not None and truth_val is not None:
+            is_correct = abs(pred_val - truth_val) < 1e-3
 
-        if is_correct: correct_count += 1
+        # 3. Store Detailed Data
+        # We save ALL candidates to analyze ranker performance later
+        candidates_data = []
+        for j in range(N):
+            candidates_data.append({
+                "text": p_cands[j],
+                "score": p_scores[j],
+                "extracted_val": extract_math_answer(p_cands[j])
+            })
 
-        status = "✅" if is_correct else "❌"
-        print(f"Sample {i+1}: {status} | Score: {best_score:.3f} | Pred: {pred_val} | Truth: {truth_vals[i]}")
+        results.append({
+            "id": i,
+            "problem": problems[i],
+            "ground_truth_full": ground_truths[i],
+            "ground_truth_val": truth_val,
+            "selected_pred_full": best_cand_text,
+            "selected_pred_val": pred_val,
+            "selected_score": best_score,
+            "is_correct": is_correct,
+            "candidates": candidates_data # Rich data for analysis
+        })
 
-    accuracy = correct_count / NUM_SAMPLES
-    print(f"\n=== Best-of-{N} ({PRM_MODE}) Accuracy: {accuracy:.2%} ({correct_count}/{NUM_SAMPLES}) ===")
+    # ==========================================
+    # Final Metrics & Save
+    # ==========================================
+    total_time = time_gen + time_score
+    metrics = calculate_metrics(results, total_time)
+
+    # Add timing breakdown to metrics
+    metrics["time_generation"] = time_gen
+    metrics["time_scoring"] = time_score
+    metrics["avg_time_per_problem"] = total_time / len(problems)
+
+    save_path = save_experiment_results(
+        experiment_name=EXPERIMENT_NAME,
+        config=config,
+        results=results,
+        metrics=metrics
+    )
+
+    print(f"\n{'='*40}")
+    print(f"BEST-OF-{N} SUMMARY ({PRM_MODE})")
+    print(f"{'='*40}")
+    print(f"Accuracy    : {metrics['accuracy']:.2%} ({metrics['correct_count']}/{metrics['total_samples']})")
+    print(f"Time (Gen)  : {time_gen:.2f}s")
+    print(f"Time (Score): {time_score:.2f}s")
+    print(f"Total Time  : {total_time:.2f}s")
+    print(f"Results     : {save_path}")
+    print(f"{'='*40}")
 
 if __name__ == "__main__":
     main()
