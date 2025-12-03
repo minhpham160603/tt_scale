@@ -416,6 +416,152 @@ class HybridSearcher:
         print(f"=> Winner: {best['score']:.3f}")
         return best["text"]
 
+    def run_parallel_backtrack(self, prompt: str) -> str:
+        print(f"\n--- Parallel Backtrack Run: {prompt[:50]}... ---")
+
+        # Each branch keeps a partial answer and scoring history
+        active_branches = [
+            {
+                "partial": "",           # partial answer text so far
+                "retries": 0,            # how many times we re-sampled this branch
+                "cumulative_score": 1.0, # used for pruning
+                "history": [1.0],        # list of step scores
+            }
+        ]
+        finished_branches = []
+
+        step_count = 0
+        # optional safety cap (local, doesn't affect teammate's code)
+        MAX_STEPS_LOCAL = 50
+
+        while active_branches:
+            step_count += 1
+            if step_count > MAX_STEPS_LOCAL:
+                print("Max steps reached in backtrack parallel search.")
+                break
+
+            print(f"--- Step {step_count} | Generating for {len(active_branches)} branches... ---")
+
+            # Build full prompts for all active branches
+            contexts = [
+                self.gen.build_input_context(prompt, b["partial"])
+                for b in active_branches
+            ]
+
+            # Simple length guard
+            if any(len(ctx) > self.max_len * 4 for ctx in contexts):
+                print("Context too long, stopping.")
+                break
+
+            # One sample per branch; cloning is handled in this method
+            try:
+                batch_outputs = self.gen.generate_batch_step(
+                    contexts,
+                    retry_attempt=0,   # could be tuned; kept simple here
+                    M_EXPANSION=1,
+                )
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    print("OOM Error! Clearing cache and reducing branches.")
+                    torch.cuda.empty_cache()
+                    active_branches = active_branches[:1]
+                    continue
+                raise e
+
+            next_active_branches = []
+
+            for i, (branch, seqs) in enumerate(zip(active_branches, batch_outputs)):
+                # We set M_EXPANSION=1 above, so seqs should have length 1
+                if not seqs:
+                    continue
+                new_chunk, is_eos = seqs[0]
+
+                if not new_chunk:
+                    # If nothing new but EOS, treat current partial as finished
+                    if is_eos and branch["partial"]:
+                        finished_branches.append(
+                            {"text": branch["partial"], "score": branch["cumulative_score"]}
+                        )
+                    continue
+
+                candidate_answer = branch["partial"] + new_chunk
+
+                # PRM score for this extended branch
+                score = self.prm.get_score(prompt, candidate_answer)
+
+                # Accept branch if score high enough or retries exhausted
+                if score >= TAU or branch["retries"] >= MAX_RETRIES:
+                    if score >= TAU:
+                        print(f"  Br {i}: ✅ Pass ({score:.2f})")
+                    else:
+                        print(f"  Br {i}: ⚠️ Force-keep ({score:.2f})")
+
+                    new_branch = {
+                        "partial": candidate_answer,
+                        "retries": 0,
+                        "cumulative_score": score,
+                        "history": branch["history"] + [score],
+                    }
+
+                    # Finish if EOS or final answer detected
+                    if is_eos or (FINAL_ANSWER_PREFIX in new_chunk):
+                        finished_branches.append(
+                            {"text": candidate_answer, "score": score}
+                        )
+                    else:
+                        next_active_branches.append(new_branch)
+                else:
+                    # Score below threshold → either split (resample) or prune
+                    if branch["retries"] < MAX_RETRIES:
+                        # Decide how many clones to spawn
+                        current_total = (
+                            len(next_active_branches)
+                            + len(active_branches)
+                            - (i + 1)
+                        )
+                        num_clones = 1
+                        if current_total < MAX_TOTAL_BRANCHES:
+                            num_clones = M_EXPANSION
+
+                        print(
+                            f"  Br {i}: ❌ Fail ({score:.2f}) -> Split {num_clones}"
+                        )
+
+                        for _ in range(num_clones):
+                            next_active_branches.append(
+                                {
+                                    "partial": branch["partial"],
+                                    "retries": branch["retries"] + 1,
+                                    "cumulative_score": branch["cumulative_score"],
+                                    "history": branch["history"],
+                                }
+                            )
+                    else:
+                        print(f"  Br {i}: 💀 Pruned (max retries reached)")
+
+            # Global pruning: keep at most MAX_TOTAL_BRANCHES
+            if len(next_active_branches) > MAX_TOTAL_BRANCHES:
+                next_active_branches.sort(
+                    key=lambda x: x["cumulative_score"], reverse=True
+                )
+                next_active_branches = next_active_branches[:MAX_TOTAL_BRANCHES]
+
+            active_branches = next_active_branches
+
+            if not active_branches and not finished_branches:
+                return "Failed to generate a solution."
+
+        # Choose best finished, else best active
+        if not finished_branches:
+            if active_branches:
+                best = max(active_branches, key=lambda x: x["cumulative_score"])
+                return best["partial"]
+            return "Failed."
+
+        best = max(finished_branches, key=lambda x: x["score"])
+        print(f"=> Winner (backtrack): {best['score']:.3f}")
+        return best["text"]
+
 # ==========================================
 # 4. Execution
 # ==========================================
