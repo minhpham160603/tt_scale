@@ -94,6 +94,42 @@ class CustomPRM(AbstractPRM):
         scores = [self._extract_score(text) for text in decoded_texts]
         return scores
 
+class VLLMPRM:
+    def __init__(self, llm_engine):
+        from vllm import SamplingParams
+        self.llm = llm_engine
+        self.tokenizer = self.llm.get_tokenizer()
+        self.params = SamplingParams(temperature=0.0, max_tokens=10, stop=["\n"])
+
+    def get_score(self, question, current_partial_answer):
+        # Create a fresh Judge Prompt
+        judge_prompt = f"""
+Review the following partial solution to a math problem.
+---
+Question: {question}
+Partial Answer So Far: {current_partial_answer}
+---
+Rate the logical correctness of the LAST step in the Partial Answer on a scale of 1 to 10.
+If the logic is sound, give a high score. If there is an error, give a low score.
+Output ONLY the number.
+"""
+        messages = [
+            {"role": "system", "content": "You are a strict math grader. Output only numerical scores."},
+            {"role": "user", "content": judge_prompt}
+        ]
+        
+        full_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        outputs = self.llm.generate([full_prompt], self.params, use_tqdm=False)
+        
+        # Parse score
+        match = re.search(r"(\d+(\.\d+)?)", outputs[0].outputs[0].text)
+        if match:
+            try:
+                return max(1.0, min(10.0, float(match.group(1)))) / 10.0
+            except:
+                pass
+        return 0.0
+
 # --- Usage Example ---
 def main():
     model_name = "Qwen/Qwen3-4B" 
