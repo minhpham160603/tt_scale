@@ -5,32 +5,43 @@ from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from tt_scale.prm.logits_prm import LogitsPRM
 from tt_scale.prm.vllm_cot_prm import VLLMCoTPRM
+from tt_scale.prm.qwen_math_prm import QwenMathPRM
 import math
 from typing import List, Optional, Tuple
+from transformers import BitsAndBytesConfig
+
 
 
 # --- Configuration ---
-MODEL_NAME = "Qwen/Qwen3-4B-AWQ" # "Qwen/Qwen3-4B"
-K_TOKENS = 256        
-TAU = 0.7             
-MAX_BACKTRACKS = 3     
-NUM_SAMPLES = 30        
+# MODEL_NAME = "Qwen/Qwen3-4B-AWQ" # "Qwen/Qwen3-4B"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-AWQ"
+# MODEL_NAME = "warshanks/Qwen3-4B-Instruct-2507-AWQ"  
+# K_TOKENS = 128       
+TAU = 0.6     # threshold score to accept a step        
+MAX_BACKTRACKS = 3     # maximum backtracks before forcing a step forward
+NUM_SAMPLES = 30        # number of evaluation samples
 FINAL_ANSWER_PREFIX = "<FINAL>"
 DEBUG = False
 VERBOSE = True 
 EPSILON = 1e-3
-SEED = 79      
+SEED = 79    
+
+TEMP_ORIGIN = 0.3 # initial temperature
+TEMP_STEP = 0.1 # increase per retry
 
 
 # Parallel hybrid search
 
       
-MAX_TOTAL_BRANCHES = 12  
-PASSING_MINIMUM = 3   # minimum passing branches to avoid backtracking
-KEEPING_BRANCHES = 4
+MAX_TOTAL_BRANCHES = 6  # maximum total branches at each step
+PASSING_MINIMUM = 2   # minimum passing branches to avoid backtracking
+KEEPING_BRANCHES = 2 # branches to keep when pruning
+MAX_MODEL_LEN = 2048 # maximum model context length
 # MAX_STEPS = 100    
-MAX_FINISHED_BRANCHES = 4    
+MAX_FINISHED_BRANCHES = 2    # maximum finished branches to stop
 EPSILON = 1e-3     
+
+K_TOKENS = 256 # maximum tokens to generate per step
 # ==========================================
 # 1. VLLM Generator Wrapper
 # ==========================================
@@ -82,7 +93,7 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
         """
         Generates the next step given the full context.
         """
-        temp = 0.6 + (0.5 * retry_attempt)
+        temp = TEMP_ORIGIN + (TEMP_STEP * retry_attempt)
         
         params = SamplingParams(
             temperature=temp,
@@ -122,7 +133,7 @@ If all steps are completed, return final answer with `{FINAL_ANSWER_PREFIX}` pre
             max_tokens=K_TOKENS,
             top_p=0.9,
             top_k=40,
-            n=M_EXPANSION,
+            n=M_EXPANSION, # number of expansions per prompt
             stop=[self.stop_token],
         )
         outputs = self.llm.generate(full_contexts, params, use_tqdm=False)
@@ -271,7 +282,7 @@ class HybridSearcher:
     def run_parallel(self, prompt: str) -> str:
         print(f"\n--- Parallel Run: {prompt[:50]}... ---")
         
-        
+        # Initialize active branches
         active_branches = [
             {
                 "score": 0.0,
@@ -281,13 +292,13 @@ class HybridSearcher:
             }
         ]
 
-
-        finished_branches = []
+        
+        finished_branches = [] # collected finished branches
         protected_branches = [] # protect passed branches when backtracking
-        step_count = 0
-        retries = 1
-        jumping = False
-        finished = False
+        step_count = 0 # number of steps taken
+        retries = 1 # number of retries for current step
+        jumping = False # whether to force a jump forward
+        finished = False # whether overall generation is finished
 
         while active_branches and not finished:
             
@@ -297,8 +308,10 @@ class HybridSearcher:
             print(f"--- Step {step_count} | Generating for {len(active_branches)} branches... ---")
             
             next_active_branches = []
-            passing_branches = []
+            passing_branches = [] # to store branches that pass this step, and will be keeped while backtracking
             passing = 0
+
+            # if jumping, temporarily set passing threshold to 0
             if jumping:
                 passing_threshold = 0.0
                 jumping = False
@@ -308,8 +321,10 @@ class HybridSearcher:
 
             contexts = []
             branch_indices = []
+            # Determine how many branches to expand based on the number of active branches
             m_expansion = max(1, math.floor(MAX_TOTAL_BRANCHES/len(active_branches)))
             extra = MAX_TOTAL_BRANCHES - (m_expansion * len(active_branches))
+
             for i, branch in enumerate(active_branches):
                 if branch["finished"]:
                     continue
@@ -323,15 +338,18 @@ class HybridSearcher:
             for bi, seqs in zip(branch_indices, batch_outputs):
                 branch = active_branches[bi]
                 current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
-                candidates = [current_generated + new_chunk for (new_chunk, _) in seqs]
+                candidates = [current_generated + new_chunk + "\n\n" for (new_chunk, _) in seqs]
 
-                qa_pairs = [(prompt, cand) for cand in candidates]
-                scores = self.prm.get_scores_batch(qa_pairs)
+                # qa_pairs = [(prompt, cand) for cand in candidates]
+                questions = [prompt] 
+                partial_answers = [candidates]
+                scores = self.prm.get_scores_batch(questions, partial_answers)
 
-                for j, ((new_chunk, is_eos), score) in enumerate(zip(seqs, scores)):
+                for j, ((new_chunk, is_eos), score) in enumerate(zip(seqs, scores[0])):
                     full_answer_candidate = current_generated + new_chunk
+                    score = score[-1]
                     branch["average_score"] += score
-
+                    
                     if score > passing_threshold:
                         print(f"  Br {j}: ✅ Pass ({score:.2f})")
                         passing += 1
@@ -368,13 +386,14 @@ class HybridSearcher:
                 else:
                     active_branches = passing_branches
                 retries = 1  
-                protected_branches = []
+                protected_branches = [] # to store passing branches for multiple backtracks
 
-
+            # Otherwise, backtrack
             else:
                 print(f"  -> Insufficient passing branches ({passing}), backtracking.")
-
+                # sort the parent branches based on the average score of children branches
                 active_branches.sort(key=lambda x: x["average_score"], reverse=True)
+                # when backtracking, add passing_branches to protected_branches
                 protected_branches.extend(passing_branches)
                 # Eliminate low-score branches
                 backtrack_num = KEEPING_BRANCHES - retries/(MAX_BACKTRACKS+1) * (KEEPING_BRANCHES)
@@ -418,151 +437,6 @@ class HybridSearcher:
         print(f"=> Winner: {best['score']:.3f}")
         return best["text"]
 
-    def run_parallel_backtrack(self, prompt: str) -> str:
-        print(f"\n--- Parallel Backtrack Run: {prompt[:50]}... ---")
-
-        # Each branch keeps a partial answer and scoring history
-        active_branches = [
-            {
-                "partial": "",           # partial answer text so far
-                "retries": 0,            # how many times we re-sampled this branch
-                "cumulative_score": 1.0, # used for pruning
-                "history": [1.0],        # list of step scores
-            }
-        ]
-        finished_branches = []
-
-        step_count = 0
-        # optional safety cap (local, doesn't affect teammate's code)
-        MAX_STEPS_LOCAL = 50
-
-        while active_branches:
-            step_count += 1
-            if step_count > MAX_STEPS_LOCAL:
-                print("Max steps reached in backtrack parallel search.")
-                break
-
-            print(f"--- Step {step_count} | Generating for {len(active_branches)} branches... ---")
-
-            # Build full prompts for all active branches
-            contexts = [
-                self.gen.build_input_context(prompt, b["partial"])
-                for b in active_branches
-            ]
-
-            # Simple length guard
-            if any(len(ctx) > self.max_len * 4 for ctx in contexts):
-                print("Context too long, stopping.")
-                break
-
-            # One sample per branch; cloning is handled in this method
-            try:
-                batch_outputs = self.gen.generate_batch_step(
-                    contexts,
-                    retry_attempt=0,   # could be tuned; kept simple here
-                    M_EXPANSION=1,
-                )
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    print("OOM Error! Clearing cache and reducing branches.")
-                    torch.cuda.empty_cache()
-                    active_branches = active_branches[:1]
-                    continue
-                raise e
-
-            next_active_branches = []
-
-            for i, (branch, seqs) in enumerate(zip(active_branches, batch_outputs)):
-                # We set M_EXPANSION=1 above, so seqs should have length 1
-                if not seqs:
-                    continue
-                new_chunk, is_eos = seqs[0]
-
-                if not new_chunk:
-                    # If nothing new but EOS, treat current partial as finished
-                    if is_eos and branch["partial"]:
-                        finished_branches.append(
-                            {"text": branch["partial"], "score": branch["cumulative_score"]}
-                        )
-                    continue
-
-                candidate_answer = branch["partial"] + new_chunk
-
-                # PRM score for this extended branch
-                score = self.prm.get_score(prompt, candidate_answer)
-
-                # Accept branch if score high enough or retries exhausted
-                if score >= TAU or branch["retries"] >= MAX_RETRIES:
-                    if score >= TAU:
-                        print(f"  Br {i}: ✅ Pass ({score:.2f})")
-                    else:
-                        print(f"  Br {i}: ⚠️ Force-keep ({score:.2f})")
-
-                    new_branch = {
-                        "partial": candidate_answer,
-                        "retries": 0,
-                        "cumulative_score": score,
-                        "history": branch["history"] + [score],
-                    }
-
-                    # Finish if EOS or final answer detected
-                    if is_eos or (FINAL_ANSWER_PREFIX in new_chunk):
-                        finished_branches.append(
-                            {"text": candidate_answer, "score": score}
-                        )
-                    else:
-                        next_active_branches.append(new_branch)
-                else:
-                    # Score below threshold → either split (resample) or prune
-                    if branch["retries"] < MAX_RETRIES:
-                        # Decide how many clones to spawn
-                        current_total = (
-                            len(next_active_branches)
-                            + len(active_branches)
-                            - (i + 1)
-                        )
-                        num_clones = 1
-                        if current_total < MAX_TOTAL_BRANCHES:
-                            num_clones = M_EXPANSION
-
-                        print(
-                            f"  Br {i}: ❌ Fail ({score:.2f}) -> Split {num_clones}"
-                        )
-
-                        for _ in range(num_clones):
-                            next_active_branches.append(
-                                {
-                                    "partial": branch["partial"],
-                                    "retries": branch["retries"] + 1,
-                                    "cumulative_score": branch["cumulative_score"],
-                                    "history": branch["history"],
-                                }
-                            )
-                    else:
-                        print(f"  Br {i}: 💀 Pruned (max retries reached)")
-
-            # Global pruning: keep at most MAX_TOTAL_BRANCHES
-            if len(next_active_branches) > MAX_TOTAL_BRANCHES:
-                next_active_branches.sort(
-                    key=lambda x: x["cumulative_score"], reverse=True
-                )
-                next_active_branches = next_active_branches[:MAX_TOTAL_BRANCHES]
-
-            active_branches = next_active_branches
-
-            if not active_branches and not finished_branches:
-                return "Failed to generate a solution."
-
-        # Choose best finished, else best active
-        if not finished_branches:
-            if active_branches:
-                best = max(active_branches, key=lambda x: x["cumulative_score"])
-                return best["partial"]
-            return "Failed."
-
-        best = max(finished_branches, key=lambda x: x["score"])
-        print(f"=> Winner (backtrack): {best['score']:.3f}")
-        return best["text"]
 
 # ==========================================
 # 4. Execution
@@ -587,7 +461,7 @@ def extract_result(text):
     boxed_nums = re.findall(r"\\boxed\{\s*([-+]?\d*\.?\d+)\s*\}", text)
     if boxed_nums:
         try:
-            return float(boxed_nums[-1])  # 取最后一个 boxed 数字
+            return float(boxed_nums[-1])  
         except ValueError:
             pass
 
@@ -602,21 +476,31 @@ def extract_result(text):
 
 def extract_math_answer(text: str) -> Optional[float]:
     """Robust extraction for MATH dataset answers (\boxed{...}) or simple numbers."""
+    
+    if text is None:
+        return None
+    try:
+        s = str(text)
+    except Exception:
+        return None
+
     # 1. Prefer Boxed LaTeX
-    boxed_match = re.search(r"\\boxed{([^}]+)}", text)
+    boxed_match = re.search(r"\\boxed{([^}]+)}", s)
     if boxed_match:
         content = boxed_match.group(1).strip()
         content = content.replace('$', '').replace('\\', '').replace(',', '')
         try:
             nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", content)
             if nums: return float(nums[-1])
-        except: pass
+        except:
+            pass
 
     # 2. Fallback: Look for the last number in the text
     try:
-        nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text.replace(',', ''))
+        nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", s.replace(',', ''))
         if nums: return float(nums[-1])
-    except: pass
+    except:
+        pass
     return None
 
 
@@ -635,16 +519,39 @@ def test_gsm8k(searcher):
         answer = extract_result(output_text)
 
         answer_text = sample.get("answer", sample.get("solution"))
-        # idx = answer_text.find("####")
-        # if idx == -1:
-        #     print("Warning: Could not find '####' in ground truth answer.", answer_text)
-        #     continue
-        # if answer is None:
-        #     print("No answer extracted.")
-        #     print("Generated Text:", output_text)
-        #     # continue
-        #     break
-        # truth_answer = float(answer_text[idx+4:].strip())
+        truth_answer = extract_math_answer(answer_text) 
+        if answer is None or truth_answer is None:
+            print("No answer extracted.")
+            print("Generated Text:", output_text)
+            print("Truth Text:", answer_text)
+            continue
+        total += 1
+        correct += abs(answer - truth_answer) < EPSILON
+
+        if VERBOSE:
+            print(f"\n[Generated]: {output_text.strip()}")
+            print(f"[Truth]:     {answer_text}")
+        else:
+            print(f"[Generated Answer]: {answer} | [Truth Answer]: {truth_answer}")
+        print("now correct:", correct, "/", total)
+
+    print(f"\n\n=== GSM8K Results: {correct}/{NUM_SAMPLES} correct ===")
+
+def test_MathArena(searcher):
+# dataset = load_dataset("openai/gsm8k", "main", split="test")
+    dataset = load_dataset("MathArena/aime_2025", split="train")
+    random.seed(SEED)
+    indices = random.sample(range(len(dataset)), NUM_SAMPLES)
+    correct = 0
+    total = 0
+    for i in indices:
+        sample = dataset[i]
+        question = sample.get("question", sample.get("problem"))
+        print(f"\n\n=== Question: {question} ===")
+        output_text = searcher.run_parallel(question)
+        answer = extract_result(output_text)
+
+        answer_text = sample.get("answer", sample.get("solution"))
         truth_answer = extract_math_answer(answer_text) 
         if answer is None or truth_answer is None:
             print("No answer extracted.")
@@ -669,20 +576,23 @@ def main():
     engine = LLM(
         model=MODEL_NAME,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.5,
         trust_remote_code=True,
         dtype="float16",
-        max_model_len=1536,
-        quantization="awq"
+        max_model_len=MAX_MODEL_LEN,
+        # quantization="awq",
+        # quantization="bitsandbytes"
     )
 
     gen = VLLMGenerator(engine)
     # prm = VLLMPRM(engine)
     # prm = LogitsPRM()
-    prm = VLLMCoTPRM(engine)
+    prm = QwenMathPRM()
+    # prm = VLLMCoTPRM(engine)
     
     searcher = HybridSearcher(gen, prm, 512)
-    test_gsm8k(searcher)
+    # test_gsm8k(searcher)
+    test_MathArena(searcher)
 
 if __name__ == "__main__":
     main()
