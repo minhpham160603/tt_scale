@@ -1,5 +1,5 @@
-# transformers
-# torch
+transformers
+torch
 bitsandbytes
 accelerate
 tqdm

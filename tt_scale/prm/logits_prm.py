@@ -77,21 +77,65 @@ class LogitsPRM(AbstractPRM):
         
         return step_scores
     
-    def get_scores_batch(self, questions: list[str], answers: list[list[str]]) -> list[list[list[float]]]:
-            """
-            Implementation of the abstract method.
-            Currently uses a loop for safety because the specific logit index (-3)
-            can be fragile with padding in batch mode.
-            One question can map to multiple answers.
-            dim: num_questions x num_answers x num_steps
-            """
-            scores = []
-            for q, ans in zip(questions, answers, strict=True):
-                sub_scores = []
-                for a in ans:
-                    sub_scores.append(self.get_score(q, a))
-                scores.append(sub_scores)
-            return scores
+    def get_scores_batch(self, inputs: list[tuple[str, str]], step_separator: str = "\n\n") -> list[float]:
+        """
+        Calculates the score for a batch of (prompt, full_response) pairs.
+        Returns the score for the *last step* in each response.
+        
+        Args:
+            inputs: List of tuples [(prompt_text, partial_response_text), ...]
+            step_separator: Separator used to split steps.
+            
+        Returns:
+            List of float scores (probability of '+') for each input.
+        """
+        formatted_inputs = []
+        
+        for prompt_text, partial_response_text in inputs:
+            chat = []
+
+            steps = partial_response_text.split(step_separator)
+            
+            for i, step in enumerate(steps):
+                if i == 0:
+                    text = prompt_text + step
+                else:
+                    text = step
+                
+                chat.append({"role": "user", "content": text})
+                chat.append({"role": "assistant", "content": "+"})
+
+            full_str = self.tokenizer.apply_chat_template(
+                chat, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+            formatted_inputs.append(full_str)
+
+        # Tokenize with padding
+        encodings = self.tokenizer(
+            formatted_inputs,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        ).to(self.device)
+
+        # Batched Inference
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=encodings.input_ids,
+                attention_mask=encodings.attention_mask
+            )
+
+            seq_lengths = encodings.attention_mask.sum(dim=1)
+            
+            target_indices = seq_lengths - 3
+            relevant_logits = outputs.logits[torch.arange(len(inputs)), target_indices, :]
+            candidate_logits = relevant_logits[:, self.candidate_tokens]
+            
+            probs = candidate_logits.softmax(dim=-1)[:, 0]
+            
+            return probs.cpu().tolist()
 
 if __name__ == "__main__":
     prm = LogitsPRM()
