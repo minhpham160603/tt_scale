@@ -608,7 +608,7 @@ def main():
     
     searcher = HybridSearcher(gen, prm)
 
-    datasets = ["MathArena/hmmt_nov_2025","MathArena/aime_2025","MathArena/cmimc_2025","MathArena/brumo_2025","MathArena/apex_2025","MathArena/hmmt_nov_2025"]
+    datasets = ["MathArena/hmmt_nov_2025","MathArena/aime_2025","MathArena/cmimc_2025","MathArena/brumo_2025","MathArena/apex_2025","MathArena/hmmt_feb_2025"]
     # test_gsm8k(searcher)
     corrects, totals = 0, 0
     step_counts, retries_counts, backtrack_counts, jump_counts = 0,0,0,0

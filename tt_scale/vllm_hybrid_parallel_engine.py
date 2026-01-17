@@ -822,7 +822,7 @@ def main():
         "MathArena/cmimc_2025",
         "MathArena/brumo_2025",
         "MathArena/apex_2025",
-        "MathArena/hmmt_nov_2025",
+        "MathArena/hmmt_feb_2025",
     ]
     # test_gsm8k(searcher)
     corrects, totals = 0, 0
