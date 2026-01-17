@@ -20,7 +20,7 @@ from tt_scale.grader import extract_and_grade
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-AWQ"
 # MODEL_NAME = "warshanks/Qwen3-4B-Instruct-2507-AWQ"  
    
-TAU = 0.8     # threshold score to accept a step  0.6      
+TAU = 0.8     # threshold score to accept a step  0.8      
 MAX_BACKTRACKS = 3     # maximum backtracks before forcing a step forward
 NUM_SAMPLES = 30        # number of evaluation samples
 FINAL_ANSWER_PREFIX = "<FINAL>"
@@ -227,20 +227,9 @@ class HybridSearcher:
         max_branches: int = MAX_TOTAL_BRANCHES,
         expansion_factor: int = 2,
     ) -> str:
-        """
-        Parallel (batch) hybrid search.
 
-        - Maintain a pool of active branches (partial answers).
-        - For each step, generate 1 next chunk per branch (temperature depends on retry count).
-        - Score each branch's candidate with the PRM (batch scoring).
-        - Keep passing candidates; for failing ones, re-queue the parent branch with retries+1
-          and (optionally) clone it to increase exploration.
-        - Prune to `max_branches` by best score.
-
-        Returns (best_text, stats) to match the existing evaluation harness.
-        """
         if VERBOSE:
-            print(f"\n--- Parallel Run (replaced): {prompt[:50]}... ---")
+            print(f"\n--- Parallel Run: {prompt[:50]}... ---")
 
         active_branches = [{"answer": "", "retries": 0, "score": 0.0, "finished": False}]
         completed_branches = []
@@ -254,7 +243,7 @@ class HybridSearcher:
             step_count += 1
             if step_count > MAX_STEPS:
                 if VERBOSE:
-                    print("  -> Reached maximum steps, stopping.")
+                    print(" -> Reached maximum steps, stopping.")
                 break
 
             if VERBOSE:
@@ -262,6 +251,7 @@ class HybridSearcher:
 
             gen_results = {}
 
+            
             groups = {}
             for i, br in enumerate(active_branches):
                 groups.setdefault(br["retries"], []).append(i)
@@ -293,7 +283,6 @@ class HybridSearcher:
             if not gen_results:
                 break
 
-            
             candidates = []          
             cand_branch_idx = []     
             cand_meta = {}           
@@ -334,13 +323,14 @@ class HybridSearcher:
                     elif agg == "mean_only_final":
                         is_finished = cand_meta.get(i, ("", False))[1]
                         score = float(sum(score_seq) / len(score_seq)) if is_finished else float(score_seq[-1])
-                    else:  
+                    else:  # "last"
                         score = float(score_seq[-1])
-                        
+                    
                     score_lookup[i] = score
 
 
             next_active = []
+            rejected_candidates = [] 
             any_retried_this_step = False
 
             for i, br in enumerate(active_branches):
@@ -372,19 +362,43 @@ class HybridSearcher:
                         for _ in range(clones):
                             next_active.append(
                                 {
-                                    "answer": br["answer"],
+                                    "answer": br["answer"], 
                                     "retries": br["retries"] + 1,
                                     "score": br["score"],
                                     "finished": False,
                                 }
                             )
                     else:
-                        continue
+                        rejected_candidates.append({
+                            "original_idx": i,
+                            "current_score": score,
+                            "retries": br["retries"]
+                        })
 
             if any_retried_this_step:
                 backtrack_count += 1
 
+            if len(next_active) == 0 and len(rejected_candidates) > 0:
+                if VERBOSE:
+                    print(" -> ⚠️ All branches failed. Attempting rescue of best rejected candidate.")
+                
+                best_reject = max(rejected_candidates, key=lambda x: x['current_score'])
+                
+                
+                parent_branch = active_branches[best_reject['original_idx']]
+                
+                next_active.append({
+                    "answer": parent_branch["answer"],
+                    "retries": parent_branch["retries"] + 1, 
+                    "score": parent_branch["score"],
+                    "finished": False
+                })
+                
+                retries_count += 1
+                backtrack_count += 1
 
+
+            # --- 5. Pruning ---
             if len(next_active) > max_branches:
                 next_active.sort(key=lambda x: (x["score"], -x["retries"]), reverse=True)
                 next_active = next_active[:max_branches]
@@ -409,7 +423,6 @@ class HybridSearcher:
             return best["answer"], stats
 
         return "Failed.", stats
-
 
 
 # ==========================================
@@ -459,8 +472,6 @@ def extract_math_answer(text: str) -> Optional[float]:
         s = str(text)
     except Exception:
         return None
-
-    # Try LaTeX numeric parsing (supports \boxed, \frac, \sqrt)
     try:
         val = parse_latex_numeric(s)
         if val is not None:
@@ -484,13 +495,6 @@ def extract_math_answer(text: str) -> Optional[float]:
     except:
         pass
     return None
-
-
-
-
-
-
-
 
 
 def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", agg="last"):
@@ -535,12 +539,10 @@ def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", a
         )
         answer_text = sample.get("answer", sample.get("solution"))
 
-        # Build proper messages: user then assistant (last must be assistant)
         messages = [
             {"role": "user", "content": str(question)},
             {"role": "assistant", "content": str(output_text)},
         ]
-        # Approximate output token count via tokenizer
         tokenizer = searcher.gen.tokenizer
         output_tokens = len(tokenizer.encode(str(output_text)))
         competition_config = {"final_answer": True, "strict_parsing": False}
