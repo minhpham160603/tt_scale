@@ -4,6 +4,7 @@ import re
 from datasets import load_dataset
 import os
 import csv
+import time
 from vllm import LLM, SamplingParams
 from tt_scale.prm.logits_prm import LogitsPRM
 from tt_scale.prm.vllm_cot_prm import VLLMCoTPRM
@@ -12,7 +13,24 @@ import math
 from typing import List, Optional, Tuple
 from transformers import BitsAndBytesConfig
 from tt_scale.grader import extract_and_grade
+import sys
+import argparse
 
+
+def _append_summary_csv(path: str, row: dict) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    exists = os.path.exists(path)
+    fieldnames = list(row.keys())
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
 
 
 # --- Configuration ---
@@ -22,12 +40,16 @@ MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct-AWQ"
    
 TAU = 0.6     # threshold score to accept a step  0.6      
 MAX_BACKTRACKS = 3     # maximum backtracks before forcing a step forward
-NUM_SAMPLES = 30        # number of evaluation samples
+NUM_SAMPLES: Optional[int] = None        # optional subsample size; None means full dataset
 FINAL_ANSWER_PREFIX = "<FINAL>"
 DEBUG = False
-VERBOSE = True 
+VERBOSE = False
 EPSILON = 1e-3
 SEED = 79    
+
+# Whether to write per-dataset/per-sample CSV logs under tt_scale/logs/.
+# Use --detail-log none to disable.
+DETAIL_LOG = True
 
 TEMP_ORIGIN = 0.7 # initial temperature
 TEMP_STEP = 0.1 # increase per retry
@@ -36,15 +58,15 @@ TEMP_STEP = 0.1 # increase per retry
 # Parallel hybrid search
 
       
-MAX_TOTAL_BRANCHES = 6  # maximum total branches at each step
-PASSING_MINIMUM = 2   # minimum passing branches to avoid backtracking
-KEEPING_BRANCHES = 2 # branches to keep when pruning
+MAX_TOTAL_BRANCHES = 9  # maximum total branches at each step
+PASSING_MINIMUM = 3   # minimum passing branches to avoid backtracking
+KEEPING_BRANCHES = 3 # branches to keep when pruning
 MAX_MODEL_LEN = 3072 # maximum model context length
 MAX_STEPS = 30    
-MAX_FINISHED_BRANCHES = 2    # maximum finished branches to stop
+# MAX_FINISHED_BRANCHES = 2    # maximum finished branches to stop
 EPSILON = 1e-3     
 
-K_TOKENS = 128 # maximum tokens to generate per step
+K_TOKENS = 256 # maximum tokens to generate per step
 
 
 # ==========================================
@@ -130,11 +152,11 @@ class VLLMGenerator:
         
         return result
 
-    def generate_batch_step(self, full_contexts, retry_attempt=0, M_EXPANSION=1):
+    def generate_batch_step(self, full_contexts, retry_attempt=0, M_EXPANSION=1,k_tokens=K_TOKENS):
         temp = TEMP_ORIGIN + (TEMP_STEP * retry_attempt)
         params = SamplingParams(
             temperature=temp,
-            max_tokens=K_TOKENS,
+            max_tokens=k_tokens,
             top_p=0.9,
             top_k=40,
             n=M_EXPANSION, # number of expansions per prompt
@@ -283,7 +305,15 @@ class HybridSearcher:
     #         final_response = checkpoints[-1][0]
     #     return final_response
 
-    def run_parallel(self, prompt: str, backtrack=True, passing_minimum: int = PASSING_MINIMUM, tau: float = TAU, agg="last") -> str:
+    def run_parallel(
+        self,
+        prompt: str,
+        backtrack=True,
+        passing_minimum: int = PASSING_MINIMUM,
+        tau: float = TAU,
+        agg="last",
+        warmup: bool = False,
+    ) -> str:
         
         if VERBOSE:
             print(f"\n--- Parallel Run: {prompt[:50]}... ---")
@@ -355,9 +385,15 @@ class HybridSearcher:
                     continue
                 contexts.append(ctx)
                 branch_indices.append(i)
-            
-            batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion)
-
+            # Optional warmup: allocate a larger token budget on the first step to
+            # help the model establish the solution trajectory.
+            if warmup:
+                if step_count == 1:
+                    batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=2 * K_TOKENS)
+                else:
+                    batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=K_TOKENS)
+            else:
+                batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=K_TOKENS)
             for bi, seqs in zip(branch_indices, batch_outputs):
                 branch = active_branches[bi]
                 current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
@@ -372,9 +408,10 @@ class HybridSearcher:
                     full_answer_candidate = current_generated + new_chunk
                     if agg == "last":
                         score = score_all[-1]
-                    elif agg == "mean":
-                        # score = score_all[-1]
+                    elif agg == "mean_step":
                         score = sum(score_all)/len(score_all)
+                    elif agg == "mean_last":
+                        score = score_all[-1]
                     elif agg == "ema":
                         score = 0.5 * branch["score"] + 0.5 * score_all[-1]
                     branch["average_sub_score"] += score
@@ -385,7 +422,7 @@ class HybridSearcher:
                         passing += 1
                         
                         if is_eos or (FINAL_ANSWER_PREFIX in new_chunk): 
-                            if agg == "mean":
+                            if agg == "mean_step" or agg =="mean_last":
                                 score = sum(score_all)/len(score_all)
                             finished_branches.append({
                                 "text": full_answer_candidate,
@@ -568,7 +605,7 @@ def extract_math_answer(text: str) -> Optional[float]:
 
 
 
-def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", agg="last"):
+def test_MathArena(searcher, backtrack=True, ds_name="MathArena/hmmt_nov_2025", agg="last", warmup: bool = False):
     # Decide effective thresholds per run to avoid local/global confusion
     if not backtrack:
         tau_local = -1.0  # disable backtracking threshold
@@ -579,25 +616,34 @@ def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", a
     dataset = load_dataset(ds_name, split="train")
 
     random.seed(SEED)
-    # Prepare log file at project root to ensure discoverability
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(base_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"matharena_{MODEL_NAME.replace('/', '_')}_tau{tau_local}_M{MAX_TOTAL_BRANCHES}_K{KEEPING_BRANCHES}_{ds_name.replace('/', '_')}.csv")
-    if not os.path.exists(log_file):
-        with open(log_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["index",  "model_answer", "gold_answer", "is_correct"]) 
-    print(f"[Log] Writing to: {os.path.abspath(log_file)}")
-    # indices = random.sample(range(len(dataset)), NUM_SAMPLES)
+    log_file = None
+    if DETAIL_LOG:
+        # Prepare log file at project root to ensure discoverability
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_dir = os.path.join(base_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(
+            log_dir,
+            f"matharena_{MODEL_NAME.replace('/', '_')}_tau{tau_local}_M{MAX_TOTAL_BRANCHES}_K{KEEPING_BRANCHES}_{ds_name.replace('/', '_')}.csv",
+        )
+        if not os.path.exists(log_file):
+            with open(log_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["index", "model_answer", "gold_answer", "is_correct"])
+        print(f"[Log] Writing to: {os.path.abspath(log_file)}")
+    # Optionally sub-sample for quick sweeps
+    indices = list(range(len(dataset)))
+    if NUM_SAMPLES is not None and isinstance(NUM_SAMPLES, int) and NUM_SAMPLES > 0:
+        if NUM_SAMPLES < len(indices):
+            indices = random.sample(indices, NUM_SAMPLES)
     correct = 0
     total = 0
     step_count = 0
     retries_count = 0
     backtrack_count = 0
     jump_count = 0
-    for i in range(len(dataset)):
-        sample = dataset[i]
+    for i, ds_i in enumerate(indices):
+        sample = dataset[ds_i]
         question = sample.get("question", sample.get("problem"))
         if VERBOSE:
             print(f"\n\n=== Question: {question} ===")
@@ -606,7 +652,8 @@ def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", a
             backtrack=backtrack,
             passing_minimum=passing_minimum_local,
             tau=tau_local,
-            agg = agg
+            agg=agg,
+            warmup=warmup,
         )
         answer_text = sample.get("answer", sample.get("solution"))
 
@@ -641,17 +688,20 @@ def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", a
         jump_count += stats[3]
 
         # Append structured log record
-        try:
-            with open(log_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    i,
-                    str(model_answer),
-                    str(answer_text),
-                    bool(is_correct),
-                ])
-        except Exception as le:
-            print("log write error:", le)
+        if DETAIL_LOG and log_file:
+            try:
+                with open(log_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            int(ds_i),
+                            str(model_answer),
+                            str(answer_text),
+                            bool(is_correct),
+                        ]
+                    )
+            except Exception as le:
+                print("log write error:", le)
 
         if VERBOSE: 
             print(f"[Generated Answer]: {model_answer} | [Truth Answer]: {sample.get('answer', sample.get('solution'))}")
@@ -661,13 +711,98 @@ def test_MathArena(searcher, backtrack=True,ds_name="MathArena/hmmt_nov_2025", a
     return correct, total, (step_count, retries_count, backtrack_count, jump_count)
 
 def main():
+    global MODEL_NAME
+    global TAU, MAX_BACKTRACKS, NUM_SAMPLES, FINAL_ANSWER_PREFIX, DEBUG, VERBOSE, EPSILON, SEED
+    global TEMP_ORIGIN, TEMP_STEP
+    global MAX_TOTAL_BRANCHES, PASSING_MINIMUM, KEEPING_BRANCHES, MAX_MODEL_LEN, MAX_STEPS, K_TOKENS
+    global DETAIL_LOG
+
+    parser = argparse.ArgumentParser(
+        description="Hybrid parallel vLLM runner (supports parameter sweeps via CLI)."
+    )
+    parser.add_argument("--model", default=MODEL_NAME, help="HF model name")
+    parser.add_argument("--tau", type=float, default=TAU, help="PRM threshold")
+    parser.add_argument("--max-backtracks", type=int, default=MAX_BACKTRACKS)
+    parser.add_argument("--num-samples", type=int, default=NUM_SAMPLES, help="optional subsample size; <=0 means full")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--max-total-branches", type=int, default=MAX_TOTAL_BRANCHES, help="M")
+    parser.add_argument("--keeping-branches", type=int, default=KEEPING_BRANCHES, help="K")
+    parser.add_argument("--passing-minimum", type=int, default=PASSING_MINIMUM)
+    parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN)
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--k-tokens", type=int, default=K_TOKENS)
+    parser.add_argument("--gpu-mem-util", type=float, default=0.5)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--dtype", default="float16")
+    parser.add_argument(
+        "--agg",
+        default="last",
+        choices=["last", "mean_step", "mean_last", "ema"],
+        help="how to aggregate PRM sub-scores",
+    )
+    parser.add_argument(
+        "--backtrack",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable/disable backtracking",
+    )
+    parser.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable/disable first-step token warmup (uses 2x k-tokens on step 1)",
+    )
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        default=None,
+        help="dataset name; repeatable. If omitted, uses built-in list.",
+    )
+
+    parser.add_argument(
+        "--summary-csv",
+        default=None,
+        help="append one-line summary per dataset (and overall) to this CSV path",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="optional free-form tag written into summary-csv",
+    )
+    parser.add_argument(
+        "--detail-log",
+        default="per-dataset",
+        choices=["per-dataset", "none"],
+        help="whether to write per-dataset/per-sample logs under tt_scale/logs",
+    )
+    args = parser.parse_args()
+
+    # Apply overrides
+    MODEL_NAME = args.model
+    TAU = float(args.tau)
+    MAX_BACKTRACKS = int(args.max_backtracks)
+    SEED = int(args.seed)
+    if args.num_samples is None or int(args.num_samples) <= 0:
+        NUM_SAMPLES = None
+    else:
+        NUM_SAMPLES = int(args.num_samples)
+
+    MAX_TOTAL_BRANCHES = int(args.max_total_branches)
+    KEEPING_BRANCHES = int(args.keeping_branches)
+    PASSING_MINIMUM = int(args.passing_minimum)
+    MAX_MODEL_LEN = int(args.max_model_len)
+    MAX_STEPS = int(args.max_steps)
+    K_TOKENS = int(args.k_tokens)
+    DETAIL_LOG = (args.detail_log != "none")
+
     print("Initializing vLLM Engine...")
+    start_ts = time.perf_counter()
     engine = LLM(
         model=MODEL_NAME,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.5,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_mem_util,
         trust_remote_code=True,
-        dtype="float16",
+        dtype=args.dtype,
         max_model_len=MAX_MODEL_LEN,
         # quantization="awq",
         # quantization="bitsandbytes"
@@ -681,21 +816,72 @@ def main():
     
     searcher = HybridSearcher(gen, prm)
 
-    datasets = ["MathArena/hmmt_nov_2025","MathArena/aime_2025","MathArena/cmimc_2025","MathArena/brumo_2025","MathArena/apex_2025","MathArena/hmmt_nov_2025"]
+    datasets = args.dataset if args.dataset else [
+        "MathArena/hmmt_nov_2025",
+        "MathArena/aime_2025",
+        "MathArena/cmimc_2025",
+        "MathArena/brumo_2025",
+        "MathArena/apex_2025",
+        "MathArena/hmmt_nov_2025",
+    ]
     # test_gsm8k(searcher)
     corrects, totals = 0, 0
     step_counts, retries_counts, backtrack_counts, jump_counts = 0,0,0,0
+    overall_start_ts = time.perf_counter()
     for ds in datasets:
         print(f"\n\n\n==== Testing on dataset: {ds} ====")
-        correct, total, stats = test_MathArena(searcher,backtrack=True,ds_name=ds,agg="mean")
+        ds_start_ts = time.perf_counter()
+        correct, total, stats = test_MathArena(
+            searcher,
+            backtrack=args.backtrack,
+            ds_name=ds,
+            agg=args.agg,
+            warmup=args.warmup,
+        )
+        ds_elapsed = time.perf_counter() - ds_start_ts
         corrects += correct
         totals += total
         step_counts += stats[0]
         retries_counts += stats[1]
         backtrack_counts += stats[2]
         jump_counts += stats[3]
+
         # print(f"==== Results for {ds}: {correct}/{total} correct ====")
     print(f"\n\n\n==== Overall Results: {corrects}/{totals} correct ====")
     print(f"Steps: {step_counts}, Retries: {retries_counts}, Backtracks: {backtrack_counts}, Jumps: {jump_counts}")
+    overall_elapsed = time.perf_counter() - overall_start_ts
+    _append_summary_csv(
+        args.summary_csv,
+        {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "run_tag": args.run_tag or "",
+            "model": MODEL_NAME,
+            "dataset": "__overall__",
+            "tau": TAU,
+            "max_total_branches": MAX_TOTAL_BRANCHES,
+            "keeping_branches": KEEPING_BRANCHES,
+            "passing_minimum": PASSING_MINIMUM,
+            "k_tokens": K_TOKENS,
+            "max_steps": MAX_STEPS,
+            "max_model_len": MAX_MODEL_LEN,
+            "agg": args.agg,
+            "backtrack": bool(args.backtrack),
+            "num_samples": (NUM_SAMPLES if NUM_SAMPLES is not None else ""),
+            "seed": SEED,
+            "correct": corrects,
+            "total": totals,
+            "steps": step_counts,
+            "retries": retries_counts,
+            "backtracks": backtrack_counts,
+            "jumps": jump_counts,
+            "elapsed_s": round(overall_elapsed, 3),
+        },
+    )
+    elapsed = time.perf_counter() - start_ts
+    s_int = int(elapsed)
+    h, rem = divmod(s_int, 3600)
+    m, sec = divmod(rem, 60)
+    ms = int((elapsed - s_int) * 1000)
+    print(f"total time: ({h:02d}:{m:02d}:{sec:02d}.{ms:03d})")
 if __name__ == "__main__":
     main()
