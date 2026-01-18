@@ -9,7 +9,7 @@ method: "independent"  # Options: "collective", "independent", "beam_search", "b
 # Search parameters
 tau: 0.6  # threshold score to accept a step
 max_backtracks: 3  # maximum backtracks before forcing a step forward
-num_samples: 10  # optional subsample size; null means full dataset
+num_samples: 5  # optional subsample size; null means full dataset
 final_answer_prefix: "<FINAL>"
 
 # Debug and logging

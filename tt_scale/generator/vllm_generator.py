@@ -100,7 +100,7 @@ class VLLMGenerator:
                 new_text = out.text
                 # Return token count along with text and is_eos
                 token_count = len(out.token_ids) if hasattr(out, 'token_ids') else 0
-                is_eos = (out.finish_reason == "stop" and token_count != k_tokens)
+                is_eos = (out.finish_reason is None and token_count != k_tokens)
                 seqs.append((new_text, is_eos, token_count))
             batch_result.append(seqs)
         return batch_result

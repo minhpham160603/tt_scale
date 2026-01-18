@@ -39,8 +39,8 @@ class IndependentBacktrack(Searcher):
 
             
             groups = {}
-            for i, br in enumerate(active_branches):
-                groups.setdefault(br["retries"], []).append(i)
+            for idx, br in enumerate(active_branches):
+                groups.setdefault(br["retries"], []).append(idx)
 
             for retry_level, idxs in groups.items():
                 contexts = []
@@ -66,6 +66,7 @@ class IndependentBacktrack(Searcher):
                     new_chunk = new_chunk or ""
                     total_tokens += token_count  # Accumulate token count
                     gen_results[i] = (new_chunk, bool(is_eos))
+                    logger.debug(f" Br {i}: {new_chunk}... | Is EOS: {is_eos} | Token Count: {token_count}")
 
             if not gen_results:
                 break
