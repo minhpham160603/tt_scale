@@ -1,0 +1,50 @@
+# Example YAML configuration file for tt_scale
+# Usage: python -m tt_scale.benchmarks.hybrid_search --config config_example.yaml
+
+# Model configuration
+# model_name: "Qwen/Qwen2.5-3B-Instruct-AWQ"
+model_name: "meta-llama/Llama-3.2-1B-Instruct"
+method: "collective"  # Options: "collective", "independent", "beam_search", "best_of_n"
+
+# Search parameters
+tau: 0.6  # threshold score to accept a step
+max_backtracks: 3  # maximum backtracks before forcing a step forward
+num_samples: 10  # optional subsample size; null means full dataset
+final_answer_prefix: "<FINAL>"
+
+# Debug and logging
+debug: false
+verbose: false
+epsilon: 0.001
+seed: 79
+detail_log: true  # Whether to write per-dataset/per-sample CSV logs
+
+# Temperature configuration
+temp_origin: 0.7  # initial temperature
+temp_step: 0.1  # increase per retry
+
+# Parallel hybrid search
+max_total_branches: 9  # maximum total branches at each step
+passing_minimum: 3  # minimum passing branches to avoid backtracking
+keeping_branches: 3  # branches to keep when pruning
+max_model_len: 8192  # maximum model context length
+max_steps: 10
+k_tokens: 256  # maximum tokens to generate per step
+
+# Best of N parameters
+N: 4  # number of candidates to generate for best_of_n
+temperature: 0.8  # temperature for candidate generation in best_of_n
+max_tokens: 2048  # maximum tokens per candidate in best_of_n
+agg: "mean_step"  # aggregation method: "last", "mean", "mean_only_final"
+backtrack: true  # whether to enable backtracking
+expansion_factor: 2  # expansion factor for backtracking
+max_finished_branches: 2  # maximum finished branches to stop
+max_branches: 6  # maximum branches for independent backtrack
+warmup: false  # enable/disable first-step token warmup
+datasets: 
+  - HuggingFaceH4/MATH-500
+split: test
+
+# Note: Runtime-only settings (gpu_mem_util, tensor_parallel_size, dtype, 
+# dataset, summary_csv, run_tag) should be set via command-line arguments
+# or will use their default values

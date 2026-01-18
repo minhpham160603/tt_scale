@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, Any, Union
 from transformers import DynamicCache
+from tt_scale.config import Config
 
 # ==========================================
 # Abstract Generator Class
@@ -120,6 +121,24 @@ class AbstractPRM(ABC):
 
         Returns:
             List[float]: A list of scores corresponding to the input pairs.
+        """
+        pass
+    
+
+class Searcher(ABC):
+    """
+    Abstract base class for a Searcher.
+    It abstracts away the specific search algorithm (e.g., collective backtrack, independent backtrack).
+    """
+    def __init__(self, generator: AbstractGenerator, prm: AbstractPRM, config: Config):
+        self.generator = generator
+        self.prm = prm
+        self.config = config
+
+    @abstractmethod
+    def run(self, prompt: str, *args, **kwargs) -> str:
+        """
+        Searches for the answer to a question.
         """
         pass
     
