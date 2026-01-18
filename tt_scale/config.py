@@ -1,4 +1,4 @@
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Optional
 from typing import Literal
 
@@ -62,6 +62,8 @@ class Config:
     datasets: Optional[list] = None  # Dataset names (None means use default list)
     summary_csv: Optional[str] = None  # Path to summary CSV file
     run_tag: Optional[str] = None  # Optional tag for runs
+    system_prompt: str = "Solve the following math problem efficiently and clearly:\n\n- For simple problems (2 steps or fewer):\nProvide a concise solution with minimal explanation.\n\n- For complex problems (3 steps or more):\nUse this step-by-step format:\n\n## Step 1: [Concise description]\n[Brief explanation and calculations]\n\n## Step 2: [Concise description]\n[Brief explanation and calculations]\n\n...\n\nRegardless of the approach, always conclude with:\n\nTherefore, the final answer is: $\\boxed{answer}$. I hope it is correct.\n\nWhere [answer] is just the final number or expression that solves the problem."
+    stop_tokens: list[str] = field(default_factory=lambda: ["\n## Step", "<END_STEP>"])
 
     @classmethod
     def from_yaml(cls, yaml_path: str, **overrides):

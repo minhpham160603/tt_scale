@@ -2,17 +2,12 @@ from tt_scale.config import Config, default_config
 from vllm import SamplingParams
 
 class VLLMGenerator:
-    STOP_STRING = "<END_STEP>"
-    
     def __init__(self, llm_engine, config: Config = None):
         self.llm = llm_engine
         self.tokenizer = self.llm.get_tokenizer()
-        self.stop_token = self.STOP_STRING
         self.config = config if config is not None else default_config
-        self.SYS_PROMPT = f"""You are a genius problem solver. 
-    Solve the problem step-by-step to avoid mistakes.
-    After **EVERY logical step** of reasoning, output the token {self.STOP_STRING}.
-    If all steps are completed, return final answer with `{self.config.final_answer_prefix}` prefix, and Put your final answer within \\boxed{{}}.(for example: `{self.config.final_answer_prefix} \\boxed{{16}}` or `{self.config.final_answer_prefix} \\boxed{{90.6}}`)"""
+        self.SYS_PROMPT = config.system_prompt
+        self.stop_tokens = config.stop_tokens
 
     def build_input_context(self, question, partial_answer=""):
         """
@@ -57,7 +52,7 @@ class VLLMGenerator:
             top_p=0.9,
             top_k=40, 
             n = M_EXPANSION,
-            stop=[self.stop_token],
+            stop=self.stop_tokens,
         )
 
         # vLLM automatically uses Prefix Caching here.
@@ -68,9 +63,9 @@ class VLLMGenerator:
         for out in outputs[0].outputs:
             new_text = out.text
             finish_reason = out.finish_reason
-            is_eos = (finish_reason == "stop" and self.stop_token not in new_text)
             # Return token count along with text and is_eos
             token_count = len(out.token_ids) if hasattr(out, 'token_ids') else 0
+            is_eos = (finish_reason is None and token_count != self.config.k_tokens)
             result.append((new_text, is_eos, token_count))
         # new_text = outputs[0].outputs[0].text
         # finish_reason = outputs[0].outputs[0].finish_reason
@@ -91,10 +86,10 @@ class VLLMGenerator:
         params = SamplingParams(
             temperature=temp,
             max_tokens=k_tokens,
-            top_p=0.9,
-            top_k=40,
+            top_p=1,
+            # top_k=40,
             n=M_EXPANSION, # number of expansions per prompt
-            stop=[self.stop_token],
+            stop=self.stop_tokens,
         )
         outputs = self.llm.generate(full_contexts, params, use_tqdm=False)
         
@@ -103,9 +98,9 @@ class VLLMGenerator:
             seqs = []
             for out in o.outputs:
                 new_text = out.text
-                is_eos = (out.finish_reason == "stop" and self.stop_token not in new_text)
                 # Return token count along with text and is_eos
                 token_count = len(out.token_ids) if hasattr(out, 'token_ids') else 0
+                is_eos = (out.finish_reason == "stop" and token_count != k_tokens)
                 seqs.append((new_text, is_eos, token_count))
             batch_result.append(seqs)
         return batch_result

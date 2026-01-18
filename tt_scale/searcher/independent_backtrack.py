@@ -3,6 +3,7 @@ from tt_scale.config import Config
 from tt_scale.base_classes import *
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 class IndependentBacktrack(Searcher):
     def __init__(self, generator: AbstractGenerator, prm: AbstractPRM, config: Config):

@@ -4,7 +4,7 @@
 # Model configuration
 # model_name: "Qwen/Qwen2.5-3B-Instruct-AWQ"
 model_name: "meta-llama/Llama-3.2-1B-Instruct"
-method: "collective"  # Options: "collective", "independent", "beam_search", "best_of_n"
+method: "independent"  # Options: "collective", "independent", "beam_search", "best_of_n"
 
 # Search parameters
 tau: 0.6  # threshold score to accept a step

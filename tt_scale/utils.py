@@ -111,8 +111,7 @@ def test(searcher, ds_name):
     for i, ds_i in enumerate(indices):
         sample = dataset[ds_i]
         question = sample.get("question", sample.get("problem"))
-        if config.verbose:
-            logger.debug(f"\n\n=== Question: {question} ===")
+        logger.debug(f"\n\n=== Question: {question} ===")
         output_text, stats = searcher.run(
             question,
             backtrack=config.backtrack,
