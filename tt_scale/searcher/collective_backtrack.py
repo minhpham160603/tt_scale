@@ -45,7 +45,7 @@ class CollectiveBacktrack(Searcher):
                 "checkpoint": [],
                 "finished": False,
                 "branch_steps": 0,
-            }
+            } for _ in range(self.config.passing_minimum)
         ]
 
         

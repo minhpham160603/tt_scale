@@ -20,7 +20,7 @@ tt_scale/
 │   ├── scripts/
 │   │   └── benchmarks.py # Main benchmark script
 │   └── utils.py          # Utilities and evaluation
-├── tt_scale/config/
+├── config/
 │   └── example.yaml      # Example configuration file
 └── logs/                 # Output logs (CSV files)
 ```
@@ -43,7 +43,7 @@ pip install torch transformers datasets vllm pyyaml
 
 ### 1. Using YAML Configuration (Recommended)
 
-Create a YAML configuration file (see `tt_scale/config/example.yaml` for a template):
+Create a YAML configuration file (see `config/example.yaml` for a template):
 
 ```yaml
 model_name: "Qwen/Qwen2.5-3B-Instruct-AWQ"
