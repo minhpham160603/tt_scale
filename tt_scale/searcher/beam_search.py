@@ -1,14 +1,18 @@
+"""
+Adapt from https://github.com/huggingface/search-and-learn/blob/main/src/sal/search/beam_search.py
+"""
+
+
 from tt_scale.base_classes import Searcher
 from tt_scale.config import Config
-from vllm import SamplingParams
 from typing import Tuple, List
 from dataclasses import dataclass
 import copy
 import logging
 import numpy as np
-
+from tt_scale.utils import Stats
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.DEBUG)
 @dataclass
 class Beam:
     """Represents a single beam in the beam search."""
@@ -36,74 +40,12 @@ class BeamSearch(Searcher):
     
     def __init__(self, generator, prm, config: Config):
         super().__init__(generator, prm, config)
-        # Access the underlying vLLM engine from VLLMGenerator
-        self.llm = generator.llm
-        self.tokenizer = generator.tokenizer
-        
         # Beam search specific config (use existing config fields where possible)
-        self.num_iterations = getattr(config, 'num_iterations', config.max_steps)
-        self.beam_width = getattr(config, 'beam_width', 1)  # M in the paper
-        self.n_beams = getattr(config, 'n_beams', config.keeping_branches)  # Total beams to maintain
-        self.lookahead = getattr(config, 'lookahead', 0)  # Lookahead steps
-        self.filter_duplicates = getattr(config, 'filter_duplicates', False)
-        self.sort_completed = getattr(config, 'sort_completed', False)
-        
-        # Ensure n_beams is a multiple of beam_width
-        if self.n_beams % self.beam_width != 0:
-            self.n_beams = (self.n_beams // self.beam_width) * self.beam_width
-            if self.n_beams == 0:
-                self.n_beams = self.beam_width
-    
-    def _generate_step(self, full_context: str, lookahead_steps: int = 0) -> Tuple[str, str, int]:
-        """
-        Generate one step with optional lookahead.
-        
-        Returns:
-            (next_text, stop_reason, token_count)
-        """
-        # For the first step, use temperature; for lookahead, use greedy (temp=0)
-        temp = self.config.temperature if lookahead_steps == 0 else 0.0
-        
-        params = SamplingParams(
-            temperature=temp,
-            max_tokens=self.config.k_tokens,
-            top_p=0.9,
-            n=1,
-            stop=[self.generator.stop_token],
-        )
-        
-        outputs = self.llm.generate([full_context], params, use_tqdm=False)
-        output = outputs[0].outputs[0]
-        
-        next_text = output.text
-        stop_reason = output.finish_reason or "length"
-        token_count = len(output.token_ids) if hasattr(output, 'token_ids') else 0
-        
-        # If we have lookahead, continue generating
-        lookahead_text = next_text
-        for _ in range(lookahead_steps):
-            if stop_reason == "stop" and self.generator.stop_token not in lookahead_text:
-                break  # EOS reached
-            
-            # Continue from where we left off
-            continued_context = full_context + lookahead_text
-            lookahead_params = SamplingParams(
-                temperature=0.0,  # Greedy for lookahead
-                max_tokens=self.config.k_tokens,
-                top_p=0.9,
-                n=1,
-                stop=[self.generator.stop_token],
-            )
-            lookahead_outputs = self.llm.generate([continued_context], lookahead_params, use_tqdm=False)
-            lookahead_output = lookahead_outputs[0].outputs[0]
-            lookahead_text += lookahead_output.text
-            token_count += len(lookahead_output.token_ids) if hasattr(lookahead_output, 'token_ids') else 0
-            
-            if lookahead_output.finish_reason == "stop" and self.generator.stop_token not in lookahead_output.text:
-                stop_reason = "EOS"
-                break
-        
-        return next_text, stop_reason, token_count
+        self.num_iterations = config.max_steps
+        self.beam_width = config.keeping_branches
+        self.n_beams = config.max_total_branches
+        self.filter_duplicates = False
+        self.sort_completed = False
     
     def _aggregate_score(self, scores: List[float]) -> float:
         """Aggregate PRM scores using the configured strategy."""
@@ -117,7 +59,7 @@ class BeamSearch(Searcher):
         else:  # "last" (default)
             return float(scores[-1]) if scores else 0.0
     
-    def run(self, prompt: str, *args, **kwargs) -> Tuple[str, "Stats"]:
+    def run(self, prompt: str, *args, **kwargs) -> Tuple[str, Stats]:
         """
         Run beam search for a single prompt.
         
@@ -127,31 +69,28 @@ class BeamSearch(Searcher):
         Returns:
             Tuple[str, Stats]: (best_answer, stats)
         """
-        from tt_scale.utils import Stats
-        
         if self.config.verbose:
             logger.info(f"\n--- Beam Search: {prompt[:50]}... ---")
         
         total_tokens = 0
         step_count = 0
         
-        # Initialize beams
-        beams: List[Beam] = []
-        for i in range(self.n_beams):
-            beams.append(
-                Beam(
-                    prompt=prompt,
-                    index=i,
-                    current_text="",
-                    next_text="",
-                    stop_reason="",
-                    all_scores=[],
-                    pruned=False,
-                    completed=False,
-                    completion_tokens=0,
-                    history=[],
-                )
+        # Initialize beams (start with a single empty beam)
+        beams: List[Beam] = [
+            Beam(
+                prompt=prompt,
+                index=0,
+                current_text="",
+                next_text="",
+                stop_reason="",
+                all_scores=[],
+                pruned=False,
+                completed=False,
+                completion_tokens=0,
+                history=[],
             )
+            for _ in range(self.n_beams)
+        ]
         
         completed_beams: List[Beam] = []
         
@@ -162,96 +101,75 @@ class BeamSearch(Searcher):
             
             if not active_beams:
                 break  # All beams are done
-            
-            # Ensure we have enough beams (duplicate if needed)
-            if len(active_beams) < self.n_beams:
-                repeats = (self.n_beams // len(active_beams)) + 1
-                extended_beams = [copy.deepcopy(b) for b in (active_beams * repeats)[:self.n_beams]]
-                active_beams = extended_beams
-            
-            # Generate next step for all active beams
-            lookahead = 0 if iteration == self.num_iterations - 1 else self.lookahead
-            
+
+            # Build contexts for all active beams (like CollectiveBacktrack)
+            contexts: List[str] = []
+            live_beams: List[Beam] = []
             for beam in active_beams:
-                # Build context for this beam
-                full_context = self.generator.build_input_context(
-                    prompt, 
-                    partial_answer=beam.current_text
-                )
-                
-                if full_context is None:
+                ctx = self.generator.build_input_context(prompt, beam.current_text)
+                if ctx is None:
                     beam.completed = True
                     completed_beams.append(beam)
                     continue
-                
-                # Generate next step
-                next_text, stop_reason, token_count = self._generate_step(full_context, lookahead)
-                beam.next_text = next_text
-                beam.stop_reason = stop_reason
-                beam.completion_tokens += token_count
-                total_tokens += token_count
-                step_count += 1
-                
-                # Update beam state
-                beam.current_text += next_text
-                beam.history.append(next_text)
-                
-                # Check if beam is completed
-                if stop_reason == "stop" and self.generator.stop_token not in next_text:
-                    beam.completed = True
-                    completed_beams.append(beam)
-                elif next_text == "":
-                    beam.completed = True
-                    completed_beams.append(beam)
-            
-            # Score all active beams using PRM
-            prompts_for_scoring = [beam.prompt for beam in active_beams]
-            completions_for_scoring = [[beam.current_text] for beam in active_beams]
-            
-            # Get PRM scores: returns list[list[list[float]]] = num_questions x num_answers x num_steps
-            scores_nested = self.prm.get_scores_batch(prompts_for_scoring, completions_for_scoring)
-            
-            # Update beam scores
-            for idx, beam in enumerate(active_beams):
-                if scores_nested and idx < len(scores_nested):
-                    question_scores = scores_nested[idx]  # List of answer scores for this question
-                    if question_scores and len(question_scores) > 0:
-                        beam.all_scores = question_scores[0]  # Extract step scores for this beam (first answer)
-                    else:
-                        beam.all_scores = []
-                else:
-                    beam.all_scores = []
-            
-            # Filter out completed beams
-            active_beams = [b for b in active_beams if not b.completed]
-            
-            if not active_beams:
-                break  # All beams completed
-            
-            # Filter duplicates if enabled
-            if self.filter_duplicates:
-                unique_beams = {}
-                for beam in active_beams:
-                    if beam.current_text not in unique_beams:
-                        unique_beams[beam.current_text] = beam
-                active_beams = list(unique_beams.values())
-            
-            # Prune to top-k beams based on aggregated scores
-            top_k = self.n_beams // self.beam_width
-            if len(active_beams) > top_k:
-                agg_scores = [self._aggregate_score(b.all_scores) for b in active_beams]
-                top_indices = np.argsort(agg_scores)[-top_k:]
-                
-                # Mark non-top beams as pruned
-                for idx, beam in enumerate(active_beams):
-                    if idx not in top_indices:
-                        beam.pruned = True
-                
-                # Keep only top beams
-                active_beams = [active_beams[i] for i in top_indices]
-            
-            # Update beams list
-            beams = active_beams + [b for b in beams if b.completed or b.pruned]
+                contexts.append(ctx)
+                live_beams.append(beam)
+
+            if not live_beams:
+                break
+
+            # Expand each active beam into `beam_width` candidates using the generator directly.
+            # This mirrors the pattern in CollectiveBacktrack: generate, then score expansions.
+            batch_outputs = self.generator.generate_batch_step(
+                contexts,
+                retry_attempt=0,
+                M_EXPANSION=(self.config.N // len(active_beams))+1,
+                k_tokens=self.config.k_tokens,
+            )
+
+            expanded_beams: List[Beam] = []
+            for parent_idx, (parent_beam, seqs) in enumerate(zip(live_beams, batch_outputs)):
+                for j, (new_chunk, is_eos, token_count) in enumerate(seqs):
+                    child = copy.deepcopy(parent_beam)
+                    child.index = parent_beam.index * self.beam_width + j
+                    child.next_text = new_chunk
+                    child.stop_reason = "eos" if is_eos else ""
+                    child.current_text = (parent_beam.current_text or "") + (new_chunk or "")
+                    child.history = (parent_beam.history or []) + [new_chunk or ""]
+                    child.completion_tokens = parent_beam.completion_tokens + token_count
+
+                    total_tokens += token_count
+                    step_count += 1
+
+                    if is_eos or (new_chunk and self.config.final_answer_prefix in new_chunk) or (new_chunk == ""):
+                        child.completed = True
+                        completed_beams.append(child)
+                    expanded_beams.append(child)
+
+            if not expanded_beams:
+                break
+
+            # Score expanded beams using PRM
+            questions = [prompt]
+            partial_answers = [[b.current_text for b in expanded_beams]]
+            scores_nested = self.prm.get_scores_batch(questions, partial_answers)
+
+            # scores_nested: [ [ [step_scores...], [step_scores...], ... ] ]
+            step_scores_list = scores_nested[0] if scores_nested and len(scores_nested) > 0 else []
+            for b, step_scores in zip(expanded_beams, step_scores_list):
+                b.all_scores = step_scores or []
+
+            # Only keep non-completed for next iteration
+            next_active = [b for b in expanded_beams if not b.completed]
+
+            logger.debug(f"Active beams: {len(active_beams)}, Next active beams: {len(next_active)}, pruned to {self.beam_width}")
+            # Prune to top-n_beams based on aggregated score
+            if len(next_active) > self.beam_width:
+                agg_scores = [self._aggregate_score(b.all_scores) for b in next_active]
+                top_indices = np.argsort(agg_scores)[-self.beam_width:]
+                next_active = [next_active[i] for i in top_indices]
+
+
+            beams = next_active
         
         # Select best beam from completed beams, or from active if none completed
         if completed_beams:
@@ -264,7 +182,7 @@ class BeamSearch(Searcher):
             best_beam = completed_beams[0]
         else:
             # No completed beams, use best active beam
-            active_beams = [b for b in beams if not b.pruned and not b.completed]
+            active_beams = [b for b in beams if not b.completed]
             if active_beams:
                 active_beams = sorted(
                     active_beams,

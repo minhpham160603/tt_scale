@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Example parameter sweep for tt_scale.vllm_hybrid_parallel_engine
+# Example parameter sweep for current tt_scale entrypoint:
+#   python3 -m tt_scale.scripts.benchmarks --config <yaml>
 # Usage:
 #   bash scripts/sweep_vllm_hybrid.sh
 
@@ -14,6 +15,7 @@ if [[ -f .env/bin/activate ]]; then
 fi
 
 MODEL="Qwen/Qwen2.5-3B-Instruct-AWQ"
+BASE_CONFIG="${BASE_CONFIG:-tt_scale/config/example.yaml}"
 DATASETS=(
   "MathArena/hmmt_nov_2025"
   "MathArena/aime_2025"
@@ -30,9 +32,9 @@ for ds in "${DATASETS[@]}"; do
 done
 
 TAUS=(0.6)
-MS=6
-K_TOKENS=256
-PASSING_MINIMUMS=2
+MS=(6)
+K_TOKENS=(256)
+PASSING_MINIMUMS=(2)
 AGGS=(last mean_last mean_step)
 
 # sweep backtracking on/off
@@ -57,32 +59,51 @@ for tau in "${TAUS[@]}"; do
             for wu in "${WARMUP_MODES[@]}"; do
             echo "==== datasets=${#DATASETS[@]} tau=${tau} M=${m} K=${KEEPING_BRANCHES} k_tokens=${kt} passing_min=${pm} agg=${agg} bt=${bt} warmup=${wu} ===="
 
-              if [[ "$bt" == "backtrack" ]]; then
-                BT_FLAG="--backtrack"
-              else
-                BT_FLAG="--no-backtrack"
-              fi
+            tmp_cfg="$(mktemp -t tt_scale_sweep_XXXXXX.yaml)"
 
-              if [[ "$wu" == "warmup" ]]; then
-                WARMUP_FLAG="--warmup"
-              else
-                WARMUP_FLAG="--no-warmup"
-              fi
+            python3 - "$BASE_CONFIG" "$tmp_cfg" \
+              "$MODEL" "$tau" "$m" "$KEEPING_BRANCHES" "$kt" "$pm" "$agg" "$bt" "$wu" <<'PY'
+import sys, yaml
 
-            python3 -m tt_scale.vllm_hybrid_parallel_engine \
-              --model "$MODEL" \
+base_path = sys.argv[1]
+out_path = sys.argv[2]
+model_name = sys.argv[3]
+tau = float(sys.argv[4])
+max_total_branches = int(sys.argv[5])
+keeping_branches = int(sys.argv[6])
+k_tokens = int(sys.argv[7])
+passing_minimum = int(sys.argv[8])
+agg = sys.argv[9]
+bt = sys.argv[10]
+wu = sys.argv[11]
+
+with open(base_path, "r") as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Use the hybrid/backtrack-style searcher.
+cfg["method"] = cfg.get("method") or "collective"
+cfg["model_name"] = model_name
+cfg["tau"] = tau
+cfg["max_total_branches"] = max_total_branches
+cfg["keeping_branches"] = keeping_branches
+cfg["k_tokens"] = k_tokens
+cfg["passing_minimum"] = passing_minimum
+cfg["agg"] = agg
+cfg["backtrack"] = (bt == "backtrack")
+cfg["warmup"] = (wu == "warmup")
+
+with open(out_path, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+PY
+
+            python3 -m tt_scale.scripts.benchmarks \
+              --config "$tmp_cfg" \
               "${DATASET_ARGS[@]}" \
-              --tau "$tau" \
-              --max-total-branches "$m" \
-              --keeping-branches "$KEEPING_BRANCHES" \
-              --k-tokens "$kt" \
-              --passing-minimum "$pm" \
-              --agg "$agg" \
-              $BT_FLAG \
-              $WARMUP_FLAG \
               --detail-log none \
               --summary-csv "$SUMMARY_CSV" \
               --run-tag "$RUN_TAG"
+
+            rm -f "$tmp_cfg"
             done
           done
         done

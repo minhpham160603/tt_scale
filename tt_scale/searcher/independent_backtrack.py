@@ -7,9 +7,8 @@ logger.setLevel(logging.DEBUG)
 
 class IndependentBacktrack(Searcher):
     def __init__(self, generator: AbstractGenerator, prm: AbstractPRM, config: Config):
-        self.gen = generator
-        self.prm = prm
-        self.config = config
+        super().__init__(generator, prm, config)
+
 
     def run(
         self,
@@ -33,7 +32,7 @@ class IndependentBacktrack(Searcher):
                 logger.debug(" -> Reached maximum steps, stopping.")
                 break
 
-            logger.debug(f"\n=== Step {step_count} | Active: {len(active_branches)} ===")
+            logger.debug(f"=== Step {step_count} | Active: {len(active_branches)} ===")
 
             gen_results = {}
 
@@ -48,7 +47,8 @@ class IndependentBacktrack(Searcher):
 
                 for i in idxs:
                     br = active_branches[i]
-                    ctx = self.gen.build_input_context(prompt, br["answer"])
+                    ctx = self.generator.build_input_context(prompt, br["answer"])
+                    # logger.debug(f" Context: {ctx}")
                     if ctx is None:
                         continue
                     contexts.append(ctx)
@@ -57,16 +57,19 @@ class IndependentBacktrack(Searcher):
                 if not contexts:
                     continue
 
-                batch_outs = self.gen.generate_batch_step(
+                batch_outs = self.generator.generate_batch_step(
                     contexts, retry_attempt=retry_level, M_EXPANSION=1
                 )
 
                 for i, seqs in zip(kept_idxs, batch_outs):
                     new_chunk, is_eos, token_count = seqs[0]  
+                    if new_chunk is None:
+                        logger.warning(f" Br {i}: No new chunk generated")
+                        continue
                     new_chunk = new_chunk or ""
                     total_tokens += token_count  # Accumulate token count
                     gen_results[i] = (new_chunk, bool(is_eos))
-                    logger.debug(f" Br {i}: {new_chunk}... | Is EOS: {is_eos} | Token Count: {token_count}")
+                    # logger.debug(f" Br {i}: {new_chunk} | Is EOS: {is_eos} | Token Count: {token_count}")
 
             if not gen_results:
                 break
@@ -134,8 +137,10 @@ class IndependentBacktrack(Searcher):
                 threshold = self.config.tau - (0.05 * br["retries"])
                 passed = score >= threshold
 
-                status_icon = "✅" if passed else "❌"
-                logger.debug(f" Br {i}: {status_icon} ({score:.2f}/{threshold:.2f})")
+                if passed:
+                    logger.debug(f" Br {i}: \033[92mPass ({score:.2f}/{threshold:.2f})\033[0m")
+                else:
+                    logger.debug(f" Br {i}: \033[91mFail ({score:.2f}/{threshold:.2f})\033[0m")
 
                 if passed:
                     next_active.append(

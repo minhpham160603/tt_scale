@@ -128,7 +128,7 @@ def test(searcher, ds_name):
             {"role": "assistant", "content": str(output_text)},
         ]
         # Approximate output token count via tokenizer
-        tokenizer = searcher.gen.tokenizer
+        tokenizer = searcher.generator.tokenizer
         output_tokens = len(tokenizer.encode(str(output_text)))
         competition_config = {"final_answer": True, "strict_parsing": False}
         logger.debug(f"messages: {messages[-1]['content']}")

@@ -16,7 +16,7 @@ from tt_scale.generator.vllm_generator import VLLMGenerator
 from tt_scale.grader import extract_and_grade
 import sys
 from tt_scale.config import Config, default_config
-from tt_scale.argparse import parse_args
+from tt_scale.arg_parse import parse_args
 from tt_scale.utils import _append_summary_csv
 from tt_scale.base_classes import *
 
@@ -28,9 +28,7 @@ logger.setLevel(logging.DEBUG)
 
 class CollectiveBacktrack(Searcher):
     def __init__(self, generator, prm, config: Config):
-        self.gen = generator
-        self.prm = prm
-        self.config = config
+        super().__init__(generator, prm, config)
 
     def run(
         self,
@@ -93,12 +91,14 @@ class CollectiveBacktrack(Searcher):
                 m_expansion = int(self.config.max_total_branches/self.config.keeping_branches)
                 extra = 0
 
+            if not self.config.always_expand and retries == 1:
+                m_expansion = 1
 
             for i, branch in enumerate(active_branches):
                 if branch["finished"]:
                     continue
                 current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
-                ctx = self.gen.build_input_context(prompt, current_generated)
+                ctx = self.generator.build_input_context(prompt, current_generated)
                 if ctx is None:
                     logger.debug(f"  Br {i}: Dropped (prompt budget exceeded)")
                     continue
@@ -108,11 +108,11 @@ class CollectiveBacktrack(Searcher):
             # help the model establish the solution trajectory.
             if self.config.warmup:
                 if step_count == 1:
-                    batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=2 * self.config.k_tokens)
+                    batch_outputs = self.generator.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=2 * self.config.k_tokens)
                 else:
-                    batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=self.config.k_tokens)
+                    batch_outputs = self.generator.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=self.config.k_tokens)
             else:
-                batch_outputs = self.gen.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=self.config.k_tokens)
+                batch_outputs = self.generator.generate_batch_step(contexts, retry_attempt=retries, M_EXPANSION=m_expansion, k_tokens=self.config.k_tokens)
             for bi, seqs in zip(branch_indices, batch_outputs):
                 branch = active_branches[bi]
                 current_generated = branch["checkpoint"][-1] if branch["checkpoint"] else ""
@@ -141,7 +141,7 @@ class CollectiveBacktrack(Searcher):
                     branch["average_sub_score"] += score
                     
                     if score > passing_threshold:
-                        logger.debug(f"  Br {j}: ✅ Pass ({score:.2f})")
+                        logger.debug(f"  Br {j}: \033[92mPass ({score:.2f})\033[0m")
                         passing += 1
                         
                         if is_eos or (self.config.final_answer_prefix in new_chunk): 
@@ -165,8 +165,11 @@ class CollectiveBacktrack(Searcher):
                                 "text": full_answer_candidate,
                             })
                     else:
-                        logger.debug(f"  Br {j}: ❌ Fail ({score:.2f})")
+                        logger.debug(f"  Br {j}: \033[91mFail ({score:.2f})\033[0m")
                         
+            if len(finished_branches) >= self.config.N:
+                logger.debug(f"  -> Reached max finished branches, stopping.")
+                break
 
             # if enough passing branches, not backtracking, and prune to KEEPING_BRANCHES
             if passing + len(protected_branches) >= self.config.passing_minimum:

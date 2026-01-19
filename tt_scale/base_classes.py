@@ -83,6 +83,7 @@ class AbstractGenerator(ABC):
             List of tuples ``(full_sequence, new_cache, finished)`` – one per branch.
         """
         pass
+    
 
 
 # ==========================================
@@ -141,4 +142,3 @@ class Searcher(ABC):
         Searches for the answer to a question.
         """
         pass
-    

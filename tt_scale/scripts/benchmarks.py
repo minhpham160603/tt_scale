@@ -1,4 +1,4 @@
-from tt_scale.argparse import parse_args
+from tt_scale.arg_parse import parse_args
 from tt_scale.config import Config
 from tt_scale.generator.vllm_generator import VLLMGenerator
 from tt_scale.prm.qwen_math_prm import QwenMathPRM
@@ -34,8 +34,7 @@ def main():
         trust_remote_code=True,
         dtype=config.dtype,
         max_model_len=config.max_model_len,
-        # quantization="awq",
-        # quantization="bitsandbytes"
+        quantization=config.quantization,
     )
 
     

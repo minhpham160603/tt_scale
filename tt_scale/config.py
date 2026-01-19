@@ -19,6 +19,7 @@ class Config:
     max_backtracks: int = 3  # maximum backtracks before forcing a step forward
     num_samples: Optional[int] = None  # optional subsample size; None means full dataset
     final_answer_prefix: str = "<FINAL>"
+    quantization: Optional[str] = None
     
     # Debug and logging
     debug: bool = False
@@ -49,7 +50,7 @@ class Config:
     max_finished_branches: int = 2  # maximum finished branches to stop
     max_branches: int = 6  # maximum branches for independent backtrack
     warmup: bool = False  # enable/disable first-step token warmup (uses 2x k-tokens on step 1)
-    
+    always_expand: bool = False  # whether to always expand all branches
     # Runtime-only settings (not typically in YAML, set via CLI)
     # These are kept separate as they're infrastructure-specific
     gpu_mem_util: float = 0.5  # GPU memory utilization for vLLM

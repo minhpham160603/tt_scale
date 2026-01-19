@@ -8,7 +8,7 @@ A scalable framework for tree search algorithms with vLLM, supporting multiple s
 tt_scale/
 ├── tt_scale/              # Main package
 │   ├── config.py         # Configuration dataclass
-│   ├── argparse.py        # Command-line argument parsing
+│   ├── arg_parse.py        # Command-line argument parsing
 │   ├── base_classes.py   # Abstract base classes (Generator, PRM, Searcher)
 │   ├── generator/         # LLM generators (vLLM, HuggingFace)
 │   ├── prm/              # Process Reward Models (PRMs)

@@ -1,5 +1,9 @@
 from tt_scale.config import Config, default_config
 from vllm import SamplingParams
+import logging
+
+logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
 
 class VLLMGenerator:
     def __init__(self, llm_engine, config: Config = None):
@@ -20,25 +24,34 @@ class VLLMGenerator:
             {"role": "system", "content": self.SYS_PROMPT},
             {"role": "user", "content": question},
         ]
-        prefix_tokens = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
+        if partial_answer is not None and partial_answer != "":
+            messages.append({"role": "assistant", "content": partial_answer})
+            return self.tokenizer.apply_chat_template(
+                [messages],
+                continue_final_message=True,
+                enable_thinking=False,
+                tokenize=False,
+            )[0]
+        return self.tokenizer.apply_chat_template(
+            [messages],
             add_generation_prompt=True,
             enable_thinking=False,
-        )
+            tokenize=False,
+        )[0]
+
 
         # 2) Encode assistant partial tokens
-        pa_tokens = self.tokenizer.encode(partial_answer or "")
+        # pa_tokens = self.tokenizer.encode(partial_answer or "")
 
         # 3) Enforce budget: allow at most MAX_MODEL_LEN - 1 prompt tokens
-        max_prompt_tokens = max(1, self.config.max_model_len - 1)
-        total = len(prefix_tokens) + len(pa_tokens)
-        if total > max_prompt_tokens:
-            # keep_pa = max(0, max_prompt_tokens - len(prefix_tokens))
-            # pa_tokens = pa_tokens[-keep_pa:] if keep_pa > 0 else []
-            return None  # exceed model length
-        merged_tokens = prefix_tokens + pa_tokens
-        return self.tokenizer.decode(merged_tokens)
+        # max_prompt_tokens = max(1, self.config.max_model_len - 1)
+        # total = len(prefix_tokens) + len(pa_tokens)
+        # if total > max_prompt_tokens:
+        #     # keep_pa = max(0, max_prompt_tokens - len(prefix_tokens))
+        #     # pa_tokens = pa_tokens[-keep_pa:] if keep_pa > 0 else []
+        #     return None  # exceed model length
+        # merged_tokens = prefix_tokens + pa_tokens
+        # return self.tokenizer.decode(merged_tokens)
 
     def generate_step(self, full_context, retry_attempt=0, M_EXPANSION=1):
         """
@@ -90,6 +103,7 @@ class VLLMGenerator:
             # top_k=40,
             n=M_EXPANSION, # number of expansions per prompt
             stop=self.stop_tokens,
+            include_stop_str_in_output=True,
         )
         outputs = self.llm.generate(full_contexts, params, use_tqdm=False)
         
@@ -100,7 +114,14 @@ class VLLMGenerator:
                 new_text = out.text
                 # Return token count along with text and is_eos
                 token_count = len(out.token_ids) if hasattr(out, 'token_ids') else 0
-                is_eos = (out.finish_reason is None and token_count != k_tokens)
+                logger.debug(f" Finish Reason: {out.finish_reason}")
+                if out.finish_reason == "stop":
+                    if any(new_text.endswith(stop_token) for stop_token in self.stop_tokens):
+                        is_eos = False
+                    else:
+                        is_eos = True
+                else:
+                    is_eos = False
                 seqs.append((new_text, is_eos, token_count))
             batch_result.append(seqs)
         return batch_result

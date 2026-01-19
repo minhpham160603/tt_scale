@@ -3,6 +3,7 @@ from tt_scale.config import Config
 from vllm import SamplingParams
 from typing import Tuple
 import numpy as np
+from tt_scale.utils import Stats
 
 
 class BestOfN(Searcher):
@@ -15,8 +16,8 @@ class BestOfN(Searcher):
         # Access the underlying vLLM engine from VLLMGenerator
         self.llm = generator.llm
         self.tokenizer = generator.tokenizer
-    
-    def run(self, prompt: str, *args, **kwargs) -> Tuple[str, "Stats"]:
+
+    def run(self, prompt: str, *args, **kwargs) -> Tuple[str, Stats]:
         """
         Generates N candidates for the prompt, scores them, and returns the best one.
         
