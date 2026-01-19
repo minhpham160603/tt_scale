@@ -1,3 +1,7 @@
-transformers
 torch
-sympy
+transformers
+datasets
+bitsandbytes
+accelerate
+vllm
+pyyaml
