@@ -12,6 +12,10 @@ tt_scale/
 │   ├── base_classes.py   # Abstract base classes (Generator, PRM, Searcher)
 │   ├── generator/         # LLM generators (vLLM, HuggingFace)
 │   ├── prm/              # Process Reward Models (PRMs)
+│   ├── prm_correlation/  # PRM reliability analysis (Section 3)
+│   │   ├── generate_best_of_n.py
+│   │   ├── analyze_prm_correlation.py
+│   │   └── PRM_ANALYSIS_README.md
 │   ├── searcher/         # Search algorithms
 │   │   ├── collective_backtrack.py
 │   │   ├── independent_backtrack.py
@@ -20,6 +24,9 @@ tt_scale/
 │   ├── scripts/
 │   │   └── benchmarks.py # Main benchmark script
 │   └── utils.py          # Utilities and evaluation
+├── scripts/
+│   ├── run_prm_analysis.sh # Helper script for PRM analysis
+│   └── reproduce_matharena_mix_prm.sh # Reproduce paper PRM analysis
 ├── config/
 │   └── example.yaml      # Example configuration file
 └── logs/                 # Output logs (CSV files)
@@ -197,6 +204,63 @@ Each log entry includes:
 - **Independent Backtrack**: Each branch backtracks independently
 - **Beam Search**: Traditional beam search with PRM scoring
 - **Best-of-N**: Generate N candidates and select the best based on PRM scores
+
+## Reproducing Paper Results
+
+### PRM Reliability Analysis (Section 3)
+
+We provide scripts to reproduce the PRM reliability analysis from Section 3 of the paper. This analysis computes Pearson correlations between partial PRM scores and final correctness at different token thresholds.
+
+**Quick start:**
+
+```bash
+# Run complete analysis for a single dataset
+./scripts/run_prm_analysis.sh --dataset MathArena/aime_2025 --N 64
+
+# Or reproduce all MathArena Mix results
+./scripts/reproduce_matharena_mix_prm.sh
+```
+
+**Manual steps:**
+
+```bash
+# Step 1: Generate Best-of-64 samples
+python -m tt_scale.prm_correlation.generate_best_of_n \
+    --model_name Qwen/Qwen2.5-7B-Math-Instruct \
+    --dataset MathArena/aime_2025 \
+    --N 64 \
+    --output_dir prm_analysis_data
+
+# Step 2: Analyze correlations
+python -m tt_scale.prm_correlation.analyze_prm_correlation \
+    --data_file prm_analysis_data/MathArena_aime_2025_Qwen_Qwen2.5-7B-Math-Instruct_N64.json \
+    --prm_model Qwen/Qwen2.5-Math-PRM-7B \
+    --token_thresholds 128 256 512 1024 1536 2048 \
+    --aggregation_methods mean min last whole
+```
+
+See [tt_scale/prm_correlation/PRM_ANALYSIS_README.md](tt_scale/prm_correlation/PRM_ANALYSIS_README.md) for detailed documentation.
+
+**Key findings reproduced:**
+- Contextual threshold: correlation negligible at τ=128, reliable around τ=512
+- Mean aggregation outperforms Min for intermediate guidance
+- Qwen 2.5 PRM significantly outperforms RLHFlow (16.86% vs 11.63%)
+
+### Main Experiments (Tables 1-2)
+
+Use the main benchmark script:
+
+```bash
+# Collective Backtracking
+python -m tt_scale.scripts.benchmarks --config config/example.yaml
+
+# With custom parameters
+python -m tt_scale.scripts.benchmarks \
+    --config config/example.yaml \
+    --tau 0.6 \
+    --max-total-branches 9 \
+    --keeping-branches 3
+```
 
 ## Troubleshooting
 
