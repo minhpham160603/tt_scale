@@ -14,7 +14,8 @@ dependencies = [
     "datasets",
     "bitsandbytes",
     "accelerate",
-    "vllm"
+    "vllm",
+    "pyyaml"
 ]
 
 [tool.setuptools]
